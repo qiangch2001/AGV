@@ -1,4 +1,3 @@
-function v_safe = longitudinal_safe_speed(AGV, k, route, ctrl)
 %LONGITUDINAL_SAFE_SPEED Local (AGV-borne) longitudinal safety speed cap.
 %
 % Rule:
@@ -9,12 +8,7 @@ function v_safe = longitudinal_safe_speed(AGV, k, route, ctrl)
 % Safety model (time-headway):
 %   required gap >= d0 + h*v
 %   => v_safe = max(0, (gap - d0)/h)
-
-    if strcmp(AGV(k).phase, 'idle')
-        v_safe = Const.V_MAX;
-        return;
-    end
-
+function v_safe = longitudinal_safe_speed(AGV, k, route, ctrl)
     s_k = AGV(k).s;
 
     % Pick leader based on approach/route logic
@@ -22,7 +16,8 @@ function v_safe = longitudinal_safe_speed(AGV, k, route, ctrl)
         key = route(1); % entry letter
         leader = find_leader_idx_entry(AGV, k, key, s_k);
     else
-        leader = find_leader_idx_route(AGV, k, route, s_k);
+        v_safe = Const.V_MAX; % default
+        return;
     end
 
     if leader == 0
@@ -31,19 +26,12 @@ function v_safe = longitudinal_safe_speed(AGV, k, route, ctrl)
     end
 
     % Gap in s-domain. On approach, s is shared and increases toward 0.
-    gap = AGV(leader).s - s_k;
+    gap = AGV(leader).s - s_k - 2 * ctrl.d0; % subtract both AGV "radii"
+    gap = max(0.0, gap); % avoid negative gap
 
-    % If already overlapped (numerically), demand stop.
-    if gap <= 0
-        v_safe = 0.0;
-        return;
-    end
+    h  = max(1e-3, ctrl.h); % avoid div0
 
-    h  = max(1e-3, ctrl.h);
-    d0 = max(0.0, ctrl.d0);
-
-    v_safe = (gap - d0) / h;
-    v_safe = max(0.0, min(Const.V_MAX, v_safe));
+    v_safe = sqrt(2 * ctrl.A_MAX * gap); % braking limit
 end
 
 
@@ -63,26 +51,6 @@ function leader = find_leader_idx_entry(AGV, k, entryKey, s_k)
         end
         if AGV(j).s >= 0
             continue; % already past approach merge
-        end
-        ds = AGV(j).s - s_k;
-        if ds > 0 && ds < best_ds
-            best_ds = ds;
-            leader = j;
-        end
-    end
-end
-
-
-function leader = find_leader_idx_route(AGV, k, route, s_k)
-% Nearest leader ahead among AGVs sharing the same ROUTE (lane) for s>=0.
-    leader = 0;
-    best_ds = inf;
-    for j = 1:numel(AGV)
-        if j == k || strcmp(AGV(j).phase, 'idle')
-            continue;
-        end
-        if ~strcmp(AGV(j).route, route)
-            continue;
         end
         ds = AGV(j).s - s_k;
         if ds > 0 && ds < best_ds

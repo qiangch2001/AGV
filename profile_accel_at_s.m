@@ -1,6 +1,5 @@
-function a = profile_accel_at_s(s, profile)
 % profile.segments: array of (s_start, s_end, a)
-
+function a = profile_accel_at_s(s, profile)
     a = 0.0;
     if isempty(profile) || ~isfield(profile,'segments') || isempty(profile.segments)
         return;

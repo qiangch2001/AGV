@@ -1,6 +1,6 @@
-function dt = ensure_feasible_segment_time(v0, ds, dt, v_max, a_max, v_min)
+function dt = ensure_feasible_segment_time(v0, ds, dt, v_max, A_MAX, v_min)
 % Increase dt until constant-accel solution satisfies:
-%   a = 2(ds - v0*dt)/dt^2,  |a|<=a_max
+%   a = 2(ds - v0*dt)/dt^2,  |a|<=A_MAX
 %   v1 = v0 + a*dt,  v_min<=v1<=v_max
 %
 % This is a conservative feasibility repair. It biases toward "arrive later"
@@ -14,7 +14,7 @@ function dt = ensure_feasible_segment_time(v0, ds, dt, v_max, a_max, v_min)
         a = 2*(ds - v0*dt)/(dt*dt);
         v1 = v0 + a*dt;
         
-        okA = abs(a) <= a_max + 1e-9;
+        okA = abs(a) <= A_MAX + 1e-9;
         okV = (v1 >= v_min - 1e-9) && (v1 <= v_max + 1e-9);
         
         if okA && okV

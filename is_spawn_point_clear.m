@@ -1,9 +1,8 @@
-function ok = is_spawn_point_clear(AGV, entryKey, s_spawn, d_insert)
 %IS_SPAWN_POINT_CLEAR Guard against instantaneous overlap at creation.
 %
 % If an existing AGV from the same entry is already within d_insert meters of
 % the spawn s-position, we skip spawning this step.
-
+function ok = is_spawn_point_clear(AGV, entryKey, s_spawn, d_insert)
     ok = true;
     for j = 1:numel(AGV)
         if strcmp(AGV(j).phase, 'idle') || isempty(AGV(j).route)

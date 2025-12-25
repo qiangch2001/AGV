@@ -1,8 +1,8 @@
-function traj = define_trajectories()
+function traj = defineTrajectories()
 % Define geometric trajectories for a four-way intersection
 % Right-hand traffic, predefined paths
-    l_app = 8;     % 接近段长度
-    N_app = 20;     % 接近段采样数
+    l_app = 16;     % 接近段长度
+    N_app = 40;     % 接近段采样数
     
     traj = struct();
 

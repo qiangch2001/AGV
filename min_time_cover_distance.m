@@ -1,5 +1,5 @@
-function dt_min = min_time_cover_distance(v0, ds, v_max, a_max)
-% Minimal time to cover distance ds starting at speed v0 with |a|<=a_max,
+function dt_min = min_time_cover_distance(v0, ds, v_max, A_MAX)
+% Minimal time to cover distance ds starting at speed v0 with |a|<=A_MAX,
 % allowing acceleration up to v_max and no requirement on terminal speed.
 
     v0 = max(0, min(v_max, v0));
@@ -9,13 +9,13 @@ function dt_min = min_time_cover_distance(v0, ds, v_max, a_max)
     end
     
     % Time to accelerate from v0 to v_max
-    t_to_vmax = max(0, (v_max - v0)/a_max);
-    d_acc = v0*t_to_vmax + 0.5*a_max*t_to_vmax^2;
+    t_to_vmax = max(0, (v_max - v0)/A_MAX);
+    d_acc = v0*t_to_vmax + 0.5*A_MAX*t_to_vmax^2;
     
     if d_acc >= ds
         % Never reach v_max: solve ds = v0*t + 0.5*a*t^2
         % 0.5*a*t^2 + v0*t - ds = 0
-        A = 0.5*a_max;
+        A = 0.5*A_MAX;
         B = v0;
         C = -ds;
         t = (-B + sqrt(B^2 - 4*A*C)) / (2*A);
