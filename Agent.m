@@ -8,14 +8,12 @@ classdef Agent < handle
         RADIUS   = 1.0;
         SAFE_GAP = 0.5;
 
-        % Avoid self-references (Agent.xxx) for compatibility across MATLAB versions
-        D_MIN   = 2*Agent.RADIUS + Agent.SAFE_GAP;     % 2*RADIUS + SAFE_GAP = 2.5
+        D_MIN   = 2*Agent.RADIUS + Agent.SAFE_GAP;     % 2.5
 
         V_MAX   = 4.0;
         A_MAX   = 2.0;
-        V_SAFE  = sqrt(2*Agent.A_MAX*Agent.D_MIN);             % used for headway
-
-        HEADWAY = Agent.D_MIN / Agent.V_SAFE;  % D_MIN / V_SAFE
+        V_SAFE  = sqrt(2*Agent.A_MAX*Agent.D_MIN);     % used for headway
+        HEADWAY = Agent.D_MIN / Agent.V_SAFE;
     end
 
     properties
@@ -32,8 +30,19 @@ classdef Agent < handle
         a double = 0.0
 
         % plan: struct array
-        % plan(k): zoneId, t_in, t_out
+        % plan(k): pid, (optional s), t_in, t_out
         plan
+
+        % Crossing-field gating times (optional)
+        t_enter_field double = NaN
+        t_exit_field  double = NaN
+
+        % Crossing-field gating positions (optional)
+        s_enter_field double = NaN
+        s_exit_field  double = NaN
+
+        % Runtime crossing-field occupancy flag (set by main loop)
+        in_cross_field logical = false
     end
 
     methods
@@ -47,7 +56,12 @@ classdef Agent < handle
                 obj.s = 0.0;
                 obj.v = Agent.V_MAX;
                 obj.a = 0.0;
-                obj.plan = struct('zoneId', {}, 't_in', {}, 't_out', {});
+                obj.plan = struct('pid', {}, 't_in', {}, 't_out', {});
+                obj.t_enter_field = NaN;
+                obj.t_exit_field  = NaN;
+                obj.s_enter_field = NaN;
+                obj.s_exit_field  = NaN;
+                obj.in_cross_field = false;
                 return;
             end
 
@@ -61,15 +75,20 @@ classdef Agent < handle
             obj.v = Agent.V_MAX;
             obj.a = 0.0;
 
-            obj.plan = struct('zoneId', {}, 't_in', {}, 't_out', {});
+            obj.plan = struct('pid', {}, 't_in', {}, 't_out', {});
+            obj.t_enter_field = NaN;
+            obj.t_exit_field  = NaN;
+            obj.s_enter_field = NaN;
+            obj.s_exit_field  = NaN;
+            obj.in_cross_field = false;
         end
 
         function setPlan(obj, plan)
             obj.plan = plan;
         end
 
-        function updatePlanTime(obj, zoneId, new_t_in)
-            idx = find([obj.plan.zoneId] == zoneId, 1);
+        function updatePlanTime(obj, pid, new_t_in)
+            idx = find([obj.plan.pid] == pid, 1);
             if isempty(idx), return; end
 
             dt = new_t_in - obj.plan(idx).t_in;
