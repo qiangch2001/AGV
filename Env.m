@@ -38,16 +38,16 @@ classdef Env
                 routeEvents.(routes{i}) = struct('pid', [], 's', []);
             end
 
-            for pid = 1:numel(route_conflicts)
-                rc = route_conflicts(pid);
+            for i = 1:numel(route_conflicts)
+                rc = route_conflicts(i);
 
                 rA = rc.routeA;
                 rB = rc.routeB;
 
-                routeEvents.(rA).pid(end+1) = pid; %#ok<AGROW>
+                routeEvents.(rA).pid(end+1) = i; %#ok<AGROW>
                 routeEvents.(rA).s(end+1)   = rc.sA; %#ok<AGROW>
 
-                routeEvents.(rB).pid(end+1) = pid; %#ok<AGROW>
+                routeEvents.(rB).pid(end+1) = i; %#ok<AGROW>
                 routeEvents.(rB).s(end+1)   = rc.sB; %#ok<AGROW>
             end
 

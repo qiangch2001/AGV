@@ -116,17 +116,13 @@ tblHandle = uitable(...
     'ColumnWidth', {50,60,75,60,60,60,60} ...
     );
 
-% ----------------------------
 % Main loop
-% ----------------------------
 nSteps = round(env.T / env.DT);
 
 for step = 1:nSteps
     t_now = (step-1) * env.DT;
 
-    % ------------------------
     % Update crossing-field occupancy (runtime truth)
-    % ------------------------
     gateRoute = '';
     for j = 1:N_max
         if ~activeMask(j)
@@ -157,8 +153,11 @@ for step = 1:nSteps
             origin = r(1);
             tooClose = false;
             for j = 1:N_max
-                if ~activeMask(j), continue; end
-                if agents(j).route(1) ~= origin, continue; end
+                if ~activeMask(j)
+                    continue;
+                end
+                if agents(j).route(1) ~= origin
+                    continue; end
                 if abs(agents(j).s - s0) < Agent.D_MIN
                     tooClose = true;
                     break;

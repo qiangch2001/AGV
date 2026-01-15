@@ -116,17 +116,13 @@ tblHandle = uitable(...
     'ColumnWidth', {50,60,75,60,60,60,60} ...
     );
 
-% ----------------------------
 % Main loop
-% ----------------------------
 nSteps = round(env.T / env.DT);
 
 for step = 1:nSteps
     t_now = (step-1) * env.DT;
 
-    % ------------------------
     % Update crossing-field occupancy (runtime truth)
-    % ------------------------
     gateRoute = '';
     for j = 1:N_max
         if ~activeMask(j)
@@ -157,8 +153,12 @@ for step = 1:nSteps
             origin = r(1);
             tooClose = false;
             for j = 1:N_max
-                if ~activeMask(j), continue; end
-                if agents(j).route(1) ~= origin, continue; end
+                if ~activeMask(j)
+                    continue;
+                end
+                if agents(j).route(1) ~= origin
+                    continue;
+                end
                 if abs(agents(j).s - s0) < Agent.D_MIN
                     tooClose = true;
                     break;
@@ -167,7 +167,6 @@ for step = 1:nSteps
 
             if ~tooClose
                 activeMask(idx) = true;
-
                 agents(idx).route = r;
                 agents(idx).state = 'idle';
                 agents(idx).connectedSent = false;
@@ -175,7 +174,6 @@ for step = 1:nSteps
                 agents(idx).t_enter_field = NaN;
                 agents(idx).t_exit_field  = NaN;
                 agents(idx).in_cross_field = false;
-
                 agents(idx).s = s0;
                 agents(idx).v = Agent.V_MAX;
                 agents(idx).a = 0.0;
@@ -187,16 +185,16 @@ for step = 1:nSteps
         end
     end
 
-    % ------------------------
     % Update each active AGV
-    % ------------------------
     for i = 1:N_max
-        if ~activeMask(i), continue; end
+        if ~activeMask(i)
+            continue;
+        end
         agv = agents(i);
 
         % State machine by longitudinal position s
-        S_CONNECT = env.S_CONNECT;
-        S_CONTROL = env.S_CONTROL;
+        S_CONNECT = Env.S_CONNECT;
+        S_CONTROL = Env.S_CONTROL;
 
         if agv.s < S_CONNECT
             agv.state = 'idle';

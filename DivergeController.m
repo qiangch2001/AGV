@@ -14,9 +14,16 @@ classdef DivergeController
     %   by a braking-feasibility bound:
     %       v_safe = sqrt(2 * A_MAX * max(0, gap))
     %   where gap = (s_lead - s_fol) - D_MIN.
+    %
+    % Fix (important)
+    %   Do NOT immediately "release" leader/follower at s=0. In a discrete-time
+    %   point-mass simulation, when the leader crosses s=0, it may still
+    %   physically occupy the split region. We keep car-following active within
+    %   a short clearance zone s_release past the diverge point.
     % =========================
 
     methods (Static)
+
         function [a_cmd, info] = accelCommand(agv, agents, activeMask, env)
             % Compute accel command for one AGV using same-origin leader.
             %
@@ -26,49 +33,57 @@ classdef DivergeController
 
             info = struct('leaderId', NaN, 'gap', NaN, 'v_safe', NaN);
 
-            % Only apply before diverge point (shared approach lane)
-            if agv.s >= 0
+            % Apply on the shared approach AND a short clearance zone after the split.
+            % Rationale: in a point-mass/discrete-time simulation, the leader may have s>=0
+            % but still physically occupies the split region. We keep car-following active
+            % until the follower has progressed s_release meters past s=0.
+            s_release = Agent.D_MIN;  % [m] clearance past diverge point before releasing
+            if agv.s >= s_release
                 a_cmd = 0.0;
                 return;
             end
 
+            % Identify diverge origin (first letter of route, e.g. 'N','S','E','W')
             origin = DivergeController.originOf(agv.route);
 
-            % Find nearest leader on the same origin, still on approach (s<0)
+            % Find nearest ahead leader that shares the same origin (same approach lane)
             leadIdx = DivergeController.findNearestLeader(agv, agents, activeMask, origin);
 
-            if isempty(leadIdx)
-                % No leader: track free-flow to V_MAX
-                v_des = Agent.V_MAX;
-                a_cmd = (v_des - agv.v) / env.DT;
-                a_cmd = max(-Agent.A_MAX, min(Agent.A_MAX, a_cmd));
-                return;
+            % Default: try to accelerate back to V_MAX
+            v_des = Agent.V_MAX;
+
+            if ~isempty(leadIdx)
+                lead = agents(leadIdx);
+
+                % gap along-route (meters), subtract minimum safe spacing
+                ds  = lead.s - agv.s;
+                gap = ds - Agent.D_MIN;
+
+                % braking-feasibility safe speed
+                v_safe = sqrt(max(0, 2 * Agent.A_MAX * max(0, gap)));
+
+                info.leaderId = lead.id;
+                info.gap      = gap;
+                info.v_safe   = v_safe;
+
+                % Limit desired speed by safety
+                v_des = min(v_des, v_safe);
             end
 
-            lead = agents(leadIdx);
+            % Simple accel command to track v_des
+            a_raw = (v_des - agv.v) / env.DT;
 
-            % Longitudinal gap along shared lane (s-coordinate)
-            d = lead.s - agv.s;
-            gap = d - Agent.D_MIN;
-
-            % Braking-feasible safe speed bound
-            v_safe = sqrt(max(0.0, 2.0 * Agent.A_MAX * max(0.0, gap)));
-
-            % Desired speed is min(free-flow, safety bound)
-            v_des = min(Agent.V_MAX, v_safe);
-
-            % Accel-limited tracking
-            a_cmd = (v_des - agv.v) / env.DT;
-            a_cmd = max(-Agent.A_MAX, min(Agent.A_MAX, a_cmd));
-
-            info.leaderId = lead.id;
-            info.gap = gap;
-            info.v_safe = v_safe;
+            % Bound accel
+            a_cmd = max(-Agent.A_MAX, min(Agent.A_MAX, a_raw));
         end
+
 
         function leadIdx = findNearestLeader(agv, agents, activeMask, origin)
             leadIdx = [];
             bestDs = inf;
+
+            % Keep leaders until this distance past split (avoid immediate release at s=0)
+            s_release = Agent.D_MIN;  % [m] keep leaders until this distance past split
 
             for j = 1:numel(agents)
                 if ~activeMask(j)
@@ -77,9 +92,13 @@ classdef DivergeController
                 if agents(j).id == agv.id
                     continue;
                 end
-                if agents(j).s >= 0
-                    continue; % already diverged
+
+                % Key fix:
+                % Do NOT drop leader immediately at s>=0; only ignore when far enough past split.
+                if agents(j).s >= s_release
+                    continue; % far enough past split to ignore as leader
                 end
+
                 if DivergeController.originOf(agents(j).route) ~= origin
                     continue;
                 end
