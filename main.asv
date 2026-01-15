@@ -1,0 +1,453 @@
+% main.m
+% Diverge-point control on approach (s < 0) + crossing-field scheduling.
+%
+% FIX (important):
+%   - Do NOT apply crossing-field "t_enter_field" gate at s=0 (diverge point).
+%   - Apply it at the entry of crossing-field, i.e., the FIRST 'crossing'
+%     conflict point on that route (s_enter_field).
+%   - Allow vehicles to accelerate (free-flow) also for s >= 0; otherwise
+%     once stopped they can never restart.
+%
+% NEW (runtime gate):
+%   - Enforce mutual exclusion of crossing-field at runtime:
+%       If any AGV is inside the crossing field, conflicting routes must stop
+%       before sEnterField. Same-route may follow with a simple headway gap.
+
+clear; clc;
+
+CONFLICT_POINTS_VISIBLE = false; % set to true to show conflict points
+env = Env;
+routes = fieldnames(env.traj);
+
+% Crossing-field / conflict-point scheduler
+scheduler = IntersectionScheduler();
+
+% ----------------------------
+% Simulation settings
+% ----------------------------
+spawn_prob = 0.10;     % spawn probability per step
+N_max      = 15;       % max number of AGVs (pool size)
+
+% Route end s (finish line)
+routeEndS = struct();
+for i = 1:numel(routes)
+    r = routes{i};
+    routeEndS.(r) = max(env.traj.(r).s);
+end
+
+% ----------------------------
+% Object pool initialization
+% ----------------------------
+agents(N_max,1) = Agent();   % pre-create N_max objects
+activeMask      = false(N_max,1);
+
+defaultRoute = routes{1};
+defaultS0    = min(env.traj.(defaultRoute).s);
+for i = 1:N_max
+    agents(i).id = i;                 % fixed ID equals slot index
+    agents(i).route = defaultRoute;
+    agents(i).state = 'idle';
+    agents(i).connectedSent = false;
+    agents(i).plan = struct('pid', {}, 't_in', {}, 't_out', {});
+    agents(i).t_enter_field = NaN;
+    agents(i).t_exit_field  = NaN;
+    agents(i).in_cross_field = false;
+    agents(i).s = defaultS0;
+    agents(i).v = Agent.V_MAX;
+    agents(i).a = 0.0;
+end
+
+% ----------------------------
+% Per-agent crossing-field entry location cache
+% ----------------------------
+sEnterField = NaN(N_max,1);  % first crossing pid's s
+sExitField  = NaN(N_max,1);  % last  crossing pid's s (used to clear in_cross_field)
+
+% ----------------------------
+% Crossing-field runtime gate (mutual exclusion across routes)
+% ----------------------------
+gateRoute = '';   % current occupying route, '' means free
+
+% ----------------------------
+% Visualization
+% ----------------------------
+fig = figure('Name','AGV Intersection Simulation (Diverge + Crossing Scheduling)', 'NumberTitle','off');
+ax = axes('Parent', fig, 'Position', [0.05 0.08 0.58 0.88]);
+hold(ax,'on');
+axis(ax,'equal');
+grid(ax,'on');
+
+% Plot trajectories
+for i = 1:numel(routes)
+    r = routes{i};
+    plot(ax, env.traj.(r).x, env.traj.(r).y, '-', 'HandleVisibility','off');
+end
+
+% Plot conflict points (optional)
+if CONFLICT_POINTS_VISIBLE
+    try
+        for pid = 1:numel(env.route_conflicts)
+            plot(ax, env.route_conflicts(pid).x, env.route_conflicts(pid).y, ...
+                'kx', 'MarkerSize', 6, 'LineWidth', 1.0);
+        end
+    catch
+        % ignore
+    end
+end
+
+title(ax, 'Intersection trajectories and AGVs (diverge + crossing-field scheduling)');
+xlabel(ax,'x (m)'); ylabel(ax,'y (m)');
+
+% Pre-create markers
+agvPlot = gobjects(N_max,1);
+agvText = gobjects(N_max,1);
+for i = 1:N_max
+    agvPlot(i) = plot(ax, NaN, NaN, 'o', 'MarkerSize', 5, 'LineWidth', 1.5);
+    agvText(i) = text(ax, NaN, NaN, '', 'FontSize', 8, ...
+        'HorizontalAlignment','left', 'VerticalAlignment','bottom');
+end
+
+% Status table
+tblHandle = uitable(...
+    fig, 'Units', 'normalized', ...
+    'Position',[0.67 0.08 0.30 0.88], ...
+    'Data', cell(0,7), ...
+    'ColumnName', {'agvId','route','state','s','v','tEnter','sEnter'}, ...
+    'ColumnWidth', {50,60,75,60,60,60,60} ...
+    );
+
+% ----------------------------
+% Main loop
+% ----------------------------
+nSteps = round(env.T / env.DT);
+
+for step = 1:nSteps
+    t_now = (step-1) * env.DT;
+
+    % ------------------------
+    % Update crossing-field occupancy (runtime truth)
+    % ------------------------
+    gateRoute = '';
+    for j = 1:N_max
+        if ~activeMask(j)
+            continue;
+        end
+        if agents(j).in_cross_field
+            if isempty(gateRoute)
+                gateRoute = agents(j).route;
+            elseif ~strcmp(gateRoute, agents(j).route)
+                % Should not happen once gating is correct.
+                % Keep the first route as owner; the other will be forced to stop at entry.
+            end
+        end
+    end
+
+    % ------------------------
+    % Spawn logic
+    % ------------------------
+    if rand < spawn_prob
+        idx = find(~activeMask, 1, 'first');
+        if ~isempty(idx)
+            r = routes{randi(numel(routes))};
+
+            % Spawn at the beginning of route
+            s0 = min(env.traj.(r).s);
+
+            % Simple spawn gating: avoid immediate overlap with same-origin AGVs
+            origin = r(1);
+            tooClose = false;
+            for j = 1:N_max
+                if ~activeMask(j), continue; end
+                if agents(j).route(1) ~= origin, continue; end
+                if abs(agents(j).s - s0) < Agent.D_MIN
+                    tooClose = true;
+                    break;
+                end
+            end
+
+            if ~tooClose
+                activeMask(idx) = true;
+
+                agents(idx).route = r;
+                agents(idx).state = 'idle';
+                agents(idx).connectedSent = false;
+                agents(idx).plan = struct('pid', {}, 't_in', {}, 't_out', {});
+                agents(idx).t_enter_field = NaN;
+                agents(idx).t_exit_field  = NaN;
+                agents(idx).in_cross_field = false;
+
+                agents(idx).s = s0;
+                agents(idx).v = Agent.V_MAX;
+                agents(idx).a = 0.0;
+
+                % reset cached field entry/exit s
+                sEnterField(idx) = NaN;
+                sExitField(idx)  = NaN;
+            end
+        end
+    end
+
+    % ------------------------
+    % Update each active AGV
+    % ------------------------
+    for i = 1:N_max
+        if ~activeMask(i), continue; end
+        agv = agents(i);
+
+        % State machine by longitudinal position s
+        S_CONNECT = env.S_CONNECT;
+        S_CONTROL = env.S_CONTROL;
+
+        if agv.s < S_CONNECT
+            agv.state = 'idle';
+        elseif agv.s < S_CONTROL
+            agv.state = 'connected';
+        elseif agv.s < 0
+            agv.state = 'controlled';   % on shared approach, diverge control active
+        else
+            agv.state = 'in_int';
+        end
+
+        % ------------------------
+        % Connect event -> schedule once
+        % ------------------------
+        if strcmp(agv.state,'connected') && ~agv.connectedSent
+            [plan, ~] = scheduler.planForAgent(agv, env, t_now);
+            [tEnter, tExit, sEnter, sExit] = scheduler.confirmPlan(agv, plan, env);
+
+            agv.plan = plan;
+            agv.t_enter_field = tEnter;
+            agv.t_exit_field  = tExit;
+            agv.connectedSent = true;
+
+            % ----------------------------
+            % IMPORTANT FIX:
+            % env is an OBJECT, so use properties directly (not isfield(env,...))
+            % and compute sEnterField/sExitField robustly.
+            % ----------------------------
+            sEnterField(i) = NaN;
+            sExitField(i)  = NaN;
+
+            if ~isempty(plan)
+                % identify which plan elements are 'crossing' pids
+                crossIdx = [];
+                for k = 1:numel(plan)
+                    pid = plan(k).pid;
+                    if pid >= 1 && pid <= numel(env.route_conflicts)
+                        if strcmp(env.route_conflicts(pid).type, 'crossing')
+                            crossIdx(end+1) = k; %#ok<AGROW>
+                        end
+                    end
+                end
+
+                if ~isempty(crossIdx)
+                    k1 = crossIdx(1);
+                    k2 = crossIdx(end);
+
+                    % preferred: use plan(k).s if present
+                    if isfield(plan, 's') && ~isempty(plan(k1).s) && ~isempty(plan(k2).s)
+                        sEnterField(i) = plan(k1).s;
+                        sExitField(i)  = plan(k2).s;
+                    else
+                        % fallback: map pid -> s via env.routeEvents
+                        rpid = env.routeEvents.(agv.route).pid;
+                        rs   = env.routeEvents.(agv.route).s;
+
+                        i1 = find(rpid == plan(k1).pid, 1);
+                        i2 = find(rpid == plan(k2).pid, 1);
+
+                        if ~isempty(i1), sEnterField(i) = rs(i1); end
+                        if ~isempty(i2), sExitField(i)  = rs(i2); end
+                    end
+                end
+            end
+        end
+
+        % ------------------------
+        % Longitudinal control
+        %   - s < 0 : DivergeController (car-following on shared approach)
+        %   - s >= 0: free-flow accel to V_MAX
+        %   - crossing-field time gate: enforced at sEnterField (NOT at s=0)
+        %   - crossing-field runtime gate: enforced at sEnterField (mutual exclusion)
+        % ------------------------
+        if agv.s < 0
+            [a_cmd, ~] = DivergeController.accelCommand(agv, agents, activeMask, env);
+        else
+            % free-flow: push toward V_MAX with accel limit
+            a_cmd = (Agent.V_MAX - agv.v) / env.DT;
+            a_cmd = max(-Agent.A_MAX, min(Agent.A_MAX, a_cmd));
+        end
+
+        % -------------------------------------------------
+        % Crossing-field RUNTIME gate (mutual exclusion across routes)
+        % -------------------------------------------------
+        if ~isnan(sEnterField(i))
+            if agv.s < sEnterField(i) && ~isempty(gateRoute)
+                if ~strcmp(gateRoute, agv.route)
+                    % Different-route while field occupied: stop before entry
+                    distToEntry = max(0.0, sEnterField(i) - agv.s);
+                    a_stop = accelToStopInDistance(agv.v, distToEntry, Agent.A_MAX, env.DT);
+                    a_cmd = min(a_cmd, a_stop);
+                else
+                    % Same route: simplified headway protection to nearest leader
+                    leadIdx = findLeaderOnRoute(i, agents, activeMask);
+                    if ~isnan(leadIdx)
+                        gap = agents(leadIdx).s - agv.s;
+                        if gap < Agent.D_MIN
+                            a_cmd = min(a_cmd, -Agent.A_MAX);
+                        end
+                    end
+                end
+            end
+        end
+
+        % ---- Crossing-field time gate (planner t_enter) ----
+        if ~isnan(agv.t_enter_field) && ~isnan(sEnterField(i))
+            if agv.s < sEnterField(i)
+                distToEntry = max(0.0, sEnterField(i) - agv.s);
+                tGo = agv.t_enter_field - t_now;
+
+                if tGo > 0
+                    v_cap = distToEntry / tGo;
+                    v_cap = max(0.0, min(Agent.V_MAX, v_cap));
+
+                    v_pred = agv.v + a_cmd * env.DT;
+                    v_pred = min(v_pred, v_cap);
+
+                    a_cmd = (v_pred - agv.v) / env.DT;
+                    a_cmd = max(-Agent.A_MAX, min(Agent.A_MAX, a_cmd));
+                end
+            end
+        end
+
+        agv.a = a_cmd;
+
+        % ------------------------
+        % Integrate kinematics
+        % ------------------------
+        agv.v = agv.v + agv.a * env.DT;
+        agv.v = max(0.0, min(Agent.V_MAX, agv.v));
+        agv.s = agv.s + agv.v * env.DT;
+
+        % ------------------------
+        % Hard safety stop: time-gate backup (prevents early entry)
+        % ------------------------
+        if ~isnan(agv.t_enter_field) && ~isnan(sEnterField(i))
+            if agv.s >= sEnterField(i) && t_now < agv.t_enter_field
+                agv.s = sEnterField(i) - 1e-3;
+                agv.v = 0.0;
+                agv.a = 0.0;
+            end
+        end
+
+        % ------------------------
+        % Update runtime crossing-field occupancy flag (in/out)
+        % ------------------------
+        if ~isnan(sEnterField(i)) && ~isnan(sExitField(i))
+            if ~agv.in_cross_field && agv.s >= sEnterField(i)
+                agv.in_cross_field = true;
+            end
+            if agv.in_cross_field && agv.s >= sExitField(i)
+                agv.in_cross_field = false;
+            end
+        else
+            agv.in_cross_field = false;
+        end
+
+        % Same-step lock update: if this AGV just entered, later AGVs see the lock
+        if agv.in_cross_field
+            if isempty(gateRoute)
+                gateRoute = agv.route;
+            end
+        end
+
+        % Finish condition
+        if agv.s >= routeEndS.(agv.route)
+            activeMask(i) = false;
+            agv.state = 'done';
+            agv.in_cross_field = false;
+        end
+
+        agents(i) = agv;
+    end
+
+    % ------------------------
+    % Render
+    % ------------------------
+    if mod(step,2) == 0 || step == 1
+        for i = 1:N_max
+            if ~activeMask(i)
+                set(agvPlot(i), 'XData', NaN, 'YData', NaN);
+                set(agvText(i), 'Position', [NaN NaN 0], 'String', '');
+                continue;
+            end
+
+            agv = agents(i);
+            tr  = env.traj.(agv.route);
+
+            x = interp1(tr.s, tr.x, agv.s, 'linear', 'extrap');
+            y = interp1(tr.s, tr.y, agv.s, 'linear', 'extrap');
+
+            set(agvPlot(i), 'XData', x, 'YData', y);
+            set(agvText(i), 'Position', [x y 0], ...
+                'String', sprintf('%d:%s', agv.id, agv.state));
+        end
+
+        rows = {};
+        for i = 1:N_max
+            if ~activeMask(i), continue; end
+            rows(end+1,1:7) = {agents(i).id, agents(i).route, agents(i).state, ...
+                               agents(i).s, agents(i).v, agents(i).t_enter_field, sEnterField(i)}; %#ok<AGROW>
+        end
+        tblHandle.Data = rows;
+
+        drawnow limitrate;
+    end
+
+    pause(env.DT);
+end
+
+
+% =============================================================
+% Local helper functions (script-local)
+% =============================================================
+
+function a_cmd = accelToStopInDistance(v, dist, A_MAX, DT)
+% Return a braking acceleration (<=0) to stop before traveling `dist`.
+% Output bounded to [-A_MAX, A_MAX].
+
+    if dist <= 1e-6
+        % at stop line: brake to zero within one step
+        a_cmd = -v / max(DT, 1e-6);
+        a_cmd = max(-A_MAX, min(A_MAX, a_cmd));
+        return;
+    end
+
+    % constant-decel stop: 0 = v^2 + 2*a*dist  => a = -v^2/(2*dist)
+    a_req = -(v*v) / (2.0*dist);
+
+    a_cmd = max(-A_MAX, min(A_MAX, a_req));
+    a_cmd = min(a_cmd, 0.0);
+end
+
+function leadIdx = findLeaderOnRoute(selfIdx, agents, activeMask)
+% Find nearest leader (smallest positive s-gap) on the SAME route.
+% Returns NaN if none.
+
+    leadIdx = NaN;
+    s_self  = agents(selfIdx).s;
+    r_self  = agents(selfIdx).route;
+
+    bestGap = inf;
+    for j = 1:numel(agents)
+        if j == selfIdx, continue; end
+        if ~activeMask(j), continue; end
+        if ~strcmp(agents(j).route, r_self), continue; end
+
+        gap = agents(j).s - s_self;
+        if gap > 0 && gap < bestGap
+            bestGap = gap;
+            leadIdx = j;
+        end
+    end
+end
