@@ -17,7 +17,8 @@ clear; clc;
 
 CONFLICT_POINTS_VISIBLE = false; % set to true to show conflict points
 env = Env;
-routes = fieldnames(env.traj);
+routes = fieldnames(env.routeEvents);
+% NOTE: env.traj also contains traj.meta, so do NOT use fieldnames(env.traj) here.
 
 % Crossing-field / conflict-point scheduler
 scheduler = IntersectionScheduler();
