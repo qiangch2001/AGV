@@ -43,6 +43,19 @@ classdef Agent < handle
 
         % Runtime crossing-field occupancy flag (set by main loop)
         in_cross_field logical = false
+
+        % -------------------------
+        % Statistics logging
+        % -------------------------
+        t_spawn       double = NaN   % time when the AGV becomes active (spawned)
+
+        % New metric timestamps:
+        t_s0          double = NaN   % first time reaching s>=0 (enter intersection)
+        t_exit_int    double = NaN   % time leaving intersection (reach last plan point)
+
+        % (Optional old fields kept for backward compatibility; not used by new stats)
+        t_plan_exit   double = NaN
+        t_actual_exit double = NaN
     end
 
     methods
@@ -62,6 +75,13 @@ classdef Agent < handle
                 obj.s_enter_field = NaN;
                 obj.s_exit_field  = NaN;
                 obj.in_cross_field = false;
+
+                obj.t_spawn = NaN;
+                obj.t_s0 = NaN;
+                obj.t_exit_int = NaN;
+
+                obj.t_plan_exit = NaN;
+                obj.t_actual_exit = NaN;
                 return;
             end
 
@@ -81,6 +101,13 @@ classdef Agent < handle
             obj.s_enter_field = NaN;
             obj.s_exit_field  = NaN;
             obj.in_cross_field = false;
+
+            obj.t_spawn = NaN;
+            obj.t_s0 = NaN;
+            obj.t_exit_int = NaN;
+
+            obj.t_plan_exit = NaN;
+            obj.t_actual_exit = NaN;
         end
 
         function setPlan(obj, plan)
