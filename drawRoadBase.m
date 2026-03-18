@@ -63,7 +63,7 @@ function drawRoadBase(ax, road_half_len, lane_width, turn_R)
 
     % ---- markings (kept compatible with your earlier base logic) ----
     % Intersection helper width used by your script for stop lines
-    hwid_intersection = 2*w/(2 - sqrt(2));
+    hwid_intersection = w/(sqrt(2) - 1);
 
     % Stop lines (dashed)
     plot(ax, [-w, w], [-hwid_intersection, -hwid_intersection], markCol, ...

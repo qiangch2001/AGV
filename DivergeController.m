@@ -37,17 +37,13 @@ classdef DivergeController
             % Rationale: in a point-mass/discrete-time simulation, the leader may have s>=0
             % but still physically occupies the split region. We keep car-following active
             % until the follower has progressed s_release meters past s=0.
-            s_release = Agent.D_MIN;  % [m] clearance past diverge point before releasing
-            if agv.s >= s_release
+            if agv.s >= Agent.D_MIN
                 a_cmd = 0.0;
                 return;
             end
 
-            % Identify diverge origin (first letter of route, e.g. 'N','S','E','W')
-            origin = DivergeController.originOf(agv.route);
-
             % Find nearest ahead leader that shares the same origin (same approach lane)
-            leadIdx = DivergeController.findNearestLeader(agv, agents, activeMask, origin);
+            leadIdx = DivergeController.findNearestLeader(agv, agents, activeMask, agv.route(1));
 
             % Default: try to accelerate back to V_MAX
             v_des = Agent.V_MAX;
@@ -80,22 +76,15 @@ classdef DivergeController
 
         function leadIdx = findNearestLeader(agv, agents, activeMask, origin)
             leadIdx = [];
-            bestDs = inf;
 
-            % Keep leaders until this distance past split (avoid immediate release at s=0)
-            s_release = Agent.D_MIN;  % [m] keep leaders until this distance past split
-
-            for j = 1:numel(agents)
-                if ~activeMask(j)
-                    continue;
-                end
+            for j = find(activeMask)
                 if agents(j).id == agv.id
                     continue;
                 end
 
                 % Key fix:
                 % Do NOT drop leader immediately at s>=0; only ignore when far enough past split.
-                if agents(j).s >= s_release
+                if agents(j).s >= Agent.D_MIN
                     continue; % far enough past split to ignore as leader
                 end
 
@@ -107,8 +96,7 @@ classdef DivergeController
                 if ds <= 0
                     continue; % not ahead
                 end
-                if ds < bestDs
-                    bestDs = ds;
+                if ds < inf
                     leadIdx = j;
                 end
             end

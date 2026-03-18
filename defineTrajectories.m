@@ -1,4 +1,4 @@
-function traj = defineTrajectories()
+function traj = defineTrajectories(hwid)
 % Define geometric trajectories for a four-way intersection
 % Right-hand traffic, predefined paths
 %
@@ -14,7 +14,7 @@ function traj = defineTrajectories()
 
     lane_width = 3.0;
     lane_offset = lane_width/2;
-    hwid = 2*lane_width/(2-sqrt(2));
+    hwid = lane_width/(sqrt(2)-1);
 
     Rl = hwid + lane_offset;      % 左转半径
     Rr = hwid - lane_offset;      % 右转半径
@@ -97,14 +97,14 @@ function traj = defineTrajectories()
     traj.E2N.s = [s_app, linspace(0, l_r, N), l_r - s_app(end:-1:1)];
 
     % ---- global meta ----
-    traj.meta = struct();
-    traj.meta.l_app      = l_app;
-    traj.meta.l_straight = l_straight;
-    traj.meta.l_l        = l_l;
-    traj.meta.l_r        = l_r;
+    %traj.meta = struct();
+    %traj.meta.l_app      = l_app;
+    %traj.meta.l_straight = l_straight;
+    %traj.meta.l_l        = l_l;
+    %traj.meta.l_r        = l_r;
 
     % ---- per-route meta (critical for buildConflictMap) ----
-    addMeta = @(r,inN,outN,turnName,lenInside) setfield(traj.(r), 'meta', struct( ...
+    addMeta = @(r,inN,outN,turnName,lenInside)setfield(traj.(r), 'meta', struct( ...
         'in', inN, ...
         'out', outN, ...
         'turn', turnName, ...

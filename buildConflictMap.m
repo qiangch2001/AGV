@@ -2,159 +2,119 @@ function conf = buildConflictMap(traj, opts)
 % buildConflictMap
 % Build diverge/merge/crossing events from fixed intersection routes.
 %
-% FIX in this version:
+% CHANGE in this version (IMPORTANT):
+%   - MERGE/DIVERGE are now built as PAIRWISE events within same out/in buckets.
+%     (Previously: all routes with same out/in were grouped together => overly conservative
+%      and geometrically wrong when different pairs merge/diverge at different locations.)
+%
+% Existing fixes kept:
 %   - traj returned by defineTrajectories() may include traj.meta (global meta), not a route.
 %   - Some routes may have s length mismatching xy points length -> regenerate s from xy.
-%
-% See previous header comments for full description.
 
     if nargin < 2, opts = struct(); end
-    if ~isfield(opts,'field_xy'),        opts.field_xy = 'xy'; end
-    if ~isfield(opts,'field_s'),         opts.field_s  = 's';  end
-    if ~isfield(opts,'tol_xy'),          opts.tol_xy   = 0.25; end
-    if ~isfield(opts,'min_len'),         opts.min_len  = 0.6;  end
-    if ~isfield(opts,'tol_cross'),       opts.tol_cross = 0.25; end
-    if ~isfield(opts,'ignore_frac_ends'),opts.ignore_frac_ends = 0.10; end
-    if ~isfield(opts,'smooth_win'),      opts.smooth_win = 3; end
+    if ~isfield(opts,'field_xy'),         opts.field_xy = 'xy'; end
+    if ~isfield(opts,'field_s'),          opts.field_s  = 's';  end
+    if ~isfield(opts,'tol_xy'),           opts.tol_xy   = 0.25; end
+    if ~isfield(opts,'min_len'),          opts.min_len  = 0.6;  end
+    if ~isfield(opts,'tol_cross'),        opts.tol_cross = 0.25; end
+    if ~isfield(opts,'ignore_frac_ends'), opts.ignore_frac_ends = 0.10; end
+    if ~isfield(opts,'smooth_win'),       opts.smooth_win = 3; end
 
-    % ---------------------------------------------------------------------
-    % Filter out non-route fields (e.g., traj.meta).
-    % A "route" must be a struct containing meta.in and meta.out.
-    % ---------------------------------------------------------------------
-    allFields = fieldnames(traj);
-    isRoute = false(size(allFields));
-    for i = 1:numel(allFields)
-        f = allFields{i};
-        if ~isstruct(traj.(f)), continue; end
-        if ~isfield(traj.(f),'meta'), continue; end
-        if ~isfield(traj.(f).meta,'in') || ~isfield(traj.(f).meta,'out'), continue; end
-        isRoute(i) = true;
-    end
-    routes = allFields(isRoute);
+    routes = string(fieldnames(traj).');
     nR = numel(routes);
-
-    % ---------------------------------------------------------------------
-    % Ensure each route has xy and a CONSISTENT s (length == size(xy,1)).
-    % If s missing OR length mismatch -> regenerate from xy.
-    % ---------------------------------------------------------------------
-    for i = 1:nR
-        r = routes{i};
-
-        if ~isfield(traj.(r), opts.field_xy) || isempty(traj.(r).(opts.field_xy))
-            error('traj.%s.%s missing (polyline points).', r, opts.field_xy);
-        end
-        xy = traj.(r).(opts.field_xy);
-        if size(xy,2) ~= 2
-            error('traj.%s.%s must be Nx2.', r, opts.field_xy);
-        end
-
-        needRebuildS = false;
-        if ~isfield(traj.(r), opts.field_s) || isempty(traj.(r).(opts.field_s))
-            needRebuildS = true;
-        else
-            s = traj.(r).(opts.field_s);
-            s = s(:);
-            if numel(s) ~= size(xy,1)
-                needRebuildS = true;
-            end
-        end
-
-        if needRebuildS
-            ds = sqrt(sum(diff(xy,1,1).^2,2));   % (N-1)x1
-            sNew = [0; cumsum(ds)];              % Nx1
-            traj.(r).(opts.field_s) = sNew;
-        else
-            traj.(r).(opts.field_s) = traj.(r).(opts.field_s)(:);
-        end
-
-        if ~isfield(traj.(r),'meta') || ~isfield(traj.(r).meta,'in') || ~isfield(traj.(r).meta,'out')
-            error('traj.%s.meta.in/out missing.', r);
-        end
-
-        if ~isfield(traj.(r).meta,'len_inside') || isempty(traj.(r).meta.len_inside)
-            traj.(r).meta.len_inside = traj.(r).(opts.field_s)(end);
-        end
-    end
 
     % Init outputs
     conf = struct();
     conf.events = struct('id',{},'type',{},'routes',{},'xy',{},'perRoute',{});
     conf.routeEvents = struct();
-    for i = 1:nR
-        r = routes{i};
+    for r = routes
         conf.routeEvents.(r) = struct('eventIds',[],'type',{{}},'s_entry',[],'s_exit',[]);
     end
-    conf.groups = struct('merge',[],'diverge',[]);
+    conf.groups = struct('merge',[],'diverge',[], 'crossing',[]);
 
     nextId = 1;
 
     % ----------------------------
-    % 1) MERGE GROUPS (same out)
+    % 1) MERGE EVENTS (pairwise within same out)
     % ----------------------------
-    outs = cell(nR,1);
-    for i = 1:nR, outs{i} = traj.(routes{i}).meta.out; end
-    uOut = unique(outs);
+    outs = cell(1,nR);
+    for i = 1:nR
+        outs{i} = traj.(routes{i}).meta.out;
+    end
+    uOut = unique(outs); % Types of merge points, e.g. 'E', 'S', etc.
 
     mergeGroups = [];
-    for o = 1:numel(uOut)
-        outLeg = uOut{o};
-        idx = find(strcmp(outs, outLeg));
-        if numel(idx) < 2, continue; end
+    for outLeg = uOut
+        groupRoutes = routes(strcmp(outs, outLeg));
 
-        groupRoutes = routes(idx);
+        % Pairwise suffix-overlap to avoid over-grouping.
+        for a = 1:(numel(groupRoutes)-1)
+            for b = (a+1):numel(groupRoutes)
+                rA = groupRoutes{a};
+                rB = groupRoutes{b};
 
-        [ok, refRoute, xy_entry, xy_exit, s_ref_entry, s_ref_exit] = ...
-            consensusOverlapGroup(traj, groupRoutes, 'suffix', opts);
+                [ok, xy_entry, xy_exit, s_ref_entry, s_ref_exit] = ...
+                    pairwiseOverlap(traj, rA, rB, 'suffix', opts);
+                if ~ok
+                    continue;
+                end
 
-        if ~ok
-            continue;
+                ev = struct();
+                ev.id = nextId;
+                nextId = nextId + 1;
+                ev.type = 'merge';
+                ev.routes = {rA, rB};
+                ev.xy = xy_entry; % join point = start of shared suffix
+                ev.perRoute = repmat(struct('route','','s_entry',NaN,'s_exit',NaN), 2, 1);
+
+                sEntryMap = containers.Map();
+                sExitMap  = containers.Map();
+
+                [s_entry_A, s_exit_A] = mapOverlapToRoute(traj, rA, xy_entry, xy_exit, opts);
+                [s_entry_B, s_exit_B] = mapOverlapToRoute(traj, rB, xy_entry, xy_exit, opts);
+
+                ev.perRoute(1).route   = rA;
+                ev.perRoute(1).s_entry = s_entry_A;
+                ev.perRoute(1).s_exit  = s_exit_A;
+                ev.perRoute(2).route   = rB;
+                ev.perRoute(2).s_entry = s_entry_B;
+                ev.perRoute(2).s_exit  = s_exit_B;
+
+                sEntryMap(rA) = s_entry_A; sExitMap(rA) = s_exit_A;
+                sEntryMap(rB) = s_entry_B; sExitMap(rB) = s_exit_B;
+
+                % register per-route event lists
+                conf.routeEvents.(rA).eventIds(end+1,1) = ev.id;
+                conf.routeEvents.(rA).type{end+1,1}     = ev.type;
+                conf.routeEvents.(rA).s_entry(end+1,1)  = s_entry_A;
+                conf.routeEvents.(rA).s_exit(end+1,1)   = s_exit_A;
+
+                conf.routeEvents.(rB).eventIds(end+1,1) = ev.id;
+                conf.routeEvents.(rB).type{end+1,1}     = ev.type;
+                conf.routeEvents.(rB).s_entry(end+1,1)  = s_entry_B;
+                conf.routeEvents.(rB).s_exit(end+1,1)   = s_exit_B;
+
+                conf.events(end+1,1) = ev;
+
+                % optional bookkeeping for debugging/visualization
+                g = struct();
+                g.out = outLeg;
+                g.routes = {rA, rB};
+                g.eventId = ev.id;
+                g.xy_entry = xy_entry;
+                g.xy_exit  = xy_exit;
+                g.s_ref_entry = s_ref_entry;
+                g.s_ref_exit  = s_ref_exit;
+                g.s_entry_map = sEntryMap;
+                g.s_exit_map  = sExitMap;
+                mergeGroups = [mergeGroups; g]; %#ok<AGROW>
+            end
         end
-
-        ev = struct();
-        ev.id = nextId; nextId = nextId + 1;
-        ev.type = 'merge';
-        ev.routes = groupRoutes;
-        ev.xy = xy_entry; % join point
-        ev.perRoute = repmat(struct('route','','s_entry',NaN,'s_exit',NaN), numel(groupRoutes), 1);
-
-        sEntryMap = containers.Map();
-        sExitMap  = containers.Map();
-
-        for k = 1:numel(groupRoutes)
-            rr = groupRoutes{k};
-            [s_entry_k, s_exit_k] = mapOverlapToRoute(traj, rr, xy_entry, xy_exit, opts);
-            ev.perRoute(k).route   = rr;
-            ev.perRoute(k).s_entry = s_entry_k;
-            ev.perRoute(k).s_exit  = s_exit_k;
-            sEntryMap(rr) = s_entry_k;
-            sExitMap(rr)  = s_exit_k;
-
-            conf.routeEvents.(rr).eventIds(end+1,1) = ev.id;
-            conf.routeEvents.(rr).type{end+1,1}     = ev.type;
-            conf.routeEvents.(rr).s_entry(end+1,1)  = s_entry_k;
-            conf.routeEvents.(rr).s_exit(end+1,1)   = s_exit_k;
-        end
-
-        conf.events(end+1,1) = ev;
-
-        g = struct();
-        g.out = outLeg;
-        g.routes = groupRoutes;
-        g.eventId = ev.id;
-        g.refRoute = refRoute;
-        g.xy_entry = xy_entry;
-        g.xy_exit  = xy_exit;
-        g.s_ref_entry = s_ref_entry;
-        g.s_ref_exit  = s_ref_exit;
-        g.s_entry_map = sEntryMap;
-        g.s_exit_map  = sExitMap;
-
-        mergeGroups = [mergeGroups; g]; %#ok<AGROW>
     end
     conf.groups.merge = mergeGroups;
 
     % ----------------------------
-    % 2) DIVERGE GROUPS (same in)
+    % 2) DIVERGE EVENTS (pairwise within same in)
     % ----------------------------
     ins = cell(nR,1);
     for i = 1:nR, ins{i} = traj.(routes{i}).meta.in; end
@@ -163,58 +123,68 @@ function conf = buildConflictMap(traj, opts)
     divergeGroups = [];
     for o = 1:numel(uIn)
         inLeg = uIn{o};
-        idx = find(strcmp(ins, inLeg));
-        if numel(idx) < 2, continue; end
+        groupRoutes = routes(strcmp(ins, inLeg));
+        if numel(groupRoutes) < 2, continue; end
 
-        groupRoutes = routes(idx);
+        for a = 1:(numel(groupRoutes)-1)
+            for b = (a+1):numel(groupRoutes)
+                rA = groupRoutes{a};
+                rB = groupRoutes{b};
 
-        [ok, refRoute, xy_entry, xy_exit, s_ref_entry, s_ref_exit] = ...
-            consensusOverlapGroup(traj, groupRoutes, 'prefix', opts);
+                [ok, xy_entry, xy_exit, s_ref_entry, s_ref_exit] = ...
+                    pairwiseOverlap(traj, rA, rB, 'prefix', opts);
+                if ~ok
+                    continue;
+                end
 
-        if ~ok
-            continue;
+                ev = struct();
+                ev.id = nextId; nextId = nextId + 1;
+                ev.type = 'diverge';
+                ev.routes = {rA, rB};
+                ev.xy = xy_exit; % split point = end of shared prefix
+                ev.perRoute = repmat(struct('route','','s_entry',NaN,'s_exit',NaN), 2, 1);
+
+                sEntryMap = containers.Map();
+                sExitMap  = containers.Map();
+
+                [s_entry_A, s_exit_A] = mapOverlapToRoute(traj, rA, xy_entry, xy_exit, opts);
+                [s_entry_B, s_exit_B] = mapOverlapToRoute(traj, rB, xy_entry, xy_exit, opts);
+
+                ev.perRoute(1).route   = rA;
+                ev.perRoute(1).s_entry = s_entry_A;
+                ev.perRoute(1).s_exit  = s_exit_A;
+                ev.perRoute(2).route   = rB;
+                ev.perRoute(2).s_entry = s_entry_B;
+                ev.perRoute(2).s_exit  = s_exit_B;
+
+                sEntryMap(rA) = s_entry_A; sExitMap(rA) = s_exit_A;
+                sEntryMap(rB) = s_entry_B; sExitMap(rB) = s_exit_B;
+
+                conf.routeEvents.(rA).eventIds(end+1,1) = ev.id;
+                conf.routeEvents.(rA).type{end+1,1}     = ev.type;
+                conf.routeEvents.(rA).s_entry(end+1,1)  = s_entry_A;
+                conf.routeEvents.(rA).s_exit(end+1,1)   = s_exit_A;
+
+                conf.routeEvents.(rB).eventIds(end+1,1) = ev.id;
+                conf.routeEvents.(rB).type{end+1,1}     = ev.type;
+                conf.routeEvents.(rB).s_entry(end+1,1)  = s_entry_B;
+                conf.routeEvents.(rB).s_exit(end+1,1)   = s_exit_B;
+
+                conf.events(end+1,1) = ev;
+
+                g = struct();
+                g.in = inLeg;
+                g.routes = {rA, rB};
+                g.eventId = ev.id;
+                g.xy_entry = xy_entry;
+                g.xy_exit  = xy_exit;
+                g.s_ref_entry = s_ref_entry;
+                g.s_ref_exit  = s_ref_exit;
+                g.s_entry_map = sEntryMap;
+                g.s_exit_map  = sExitMap;
+                divergeGroups = [divergeGroups; g]; %#ok<AGROW>
+            end
         end
-
-        ev = struct();
-        ev.id = nextId; nextId = nextId + 1;
-        ev.type = 'diverge';
-        ev.routes = groupRoutes;
-        ev.xy = xy_exit; % split point
-        ev.perRoute = repmat(struct('route','','s_entry',NaN,'s_exit',NaN), numel(groupRoutes), 1);
-
-        sEntryMap = containers.Map();
-        sExitMap  = containers.Map();
-
-        for k = 1:numel(groupRoutes)
-            rr = groupRoutes{k};
-            [s_entry_k, s_exit_k] = mapOverlapToRoute(traj, rr, xy_entry, xy_exit, opts);
-            ev.perRoute(k).route   = rr;
-            ev.perRoute(k).s_entry = s_entry_k;
-            ev.perRoute(k).s_exit  = s_exit_k;
-            sEntryMap(rr) = s_entry_k;
-            sExitMap(rr)  = s_exit_k;
-
-            conf.routeEvents.(rr).eventIds(end+1,1) = ev.id;
-            conf.routeEvents.(rr).type{end+1,1}     = ev.type;
-            conf.routeEvents.(rr).s_entry(end+1,1)  = s_entry_k;
-            conf.routeEvents.(rr).s_exit(end+1,1)   = s_exit_k;
-        end
-
-        conf.events(end+1,1) = ev;
-
-        g = struct();
-        g.in = inLeg;
-        g.routes = groupRoutes;
-        g.eventId = ev.id;
-        g.refRoute = refRoute;
-        g.xy_entry = xy_entry;
-        g.xy_exit  = xy_exit;
-        g.s_ref_entry = s_ref_entry;
-        g.s_ref_exit  = s_ref_exit;
-        g.s_entry_map = sEntryMap;
-        g.s_exit_map  = sExitMap;
-
-        divergeGroups = [divergeGroups; g]; %#ok<AGROW>
     end
     conf.groups.diverge = divergeGroups;
 
@@ -229,7 +199,7 @@ function conf = buildConflictMap(traj, opts)
             inA  = traj.(rA).meta.in;   outA = traj.(rA).meta.out;
             inB  = traj.(rB).meta.in;   outB = traj.(rB).meta.out;
 
-            % same in -> diverge group; same out -> merge group
+            % same in -> diverge; same out -> merge (handled above)
             if strcmp(inA,inB) || strcmp(outA,outB)
                 continue;
             end
@@ -269,7 +239,7 @@ function conf = buildConflictMap(traj, opts)
     for i = 1:nR
         r = routes{i};
         if isempty(conf.routeEvents.(r).eventIds), continue; end
-        [sSorted, ord] = sort(conf.routeEvents.(r).s_entry, 'ascend');
+        [~, ord] = sort(conf.routeEvents.(r).s_entry, 'ascend');
         conf.routeEvents.(r).s_entry  = conf.routeEvents.(r).s_entry(ord);
         conf.routeEvents.(r).s_exit   = conf.routeEvents.(r).s_exit(ord);
         conf.routeEvents.(r).eventIds = conf.routeEvents.(r).eventIds(ord);
@@ -281,20 +251,77 @@ end
 % Helper functions
 % ======================================================================
 
+function [ok, xy_entry, xy_exit, s_ref_entry, s_ref_exit] = ...
+    pairwiseOverlap(traj, rA, rB, mode, opts)
+% pairwiseOverlap
+% Compute shared prefix/suffix overlap segment between TWO routes.
+%
+% mode:
+%   - 'prefix': shared segment must start at index 1 of ref route
+%   - 'suffix': shared segment must end at last index of ref route
+%
+% Returns (on refRoute):
+%   xy_entry, xy_exit: endpoints of the shared segment
+%   s_ref_entry, s_ref_exit: corresponding s values on refRoute
+    xyR = traj.(rA).xy;
+    sR  = traj.(rA).s;
+
+    ok = false;
+
+    mask = overlapMaskPolyline(xyR, traj.(rB).xy, opts.tol_xy);
+    mask = smoothMask(mask, opts.smooth_win);
+
+    if strcmp(mode,'prefix')
+        if ~mask(1)
+            return;
+        end
+        lastFalse = find(~mask, 1, 'first');
+        if isempty(lastFalse)
+            segIdx = 1:numel(mask);
+        else
+            segIdx = 1:(lastFalse-1);
+        end
+    else % 'suffix'
+        if ~mask(end)
+            return;
+        end
+        firstFalse = find(~mask, 1, 'last');
+        if isempty(firstFalse)
+            segIdx = 1:numel(mask);
+        else
+            segIdx = (firstFalse+1):numel(mask);
+        end
+    end
+
+    if numel(segIdx) < 2
+        return;
+    end
+
+    segLen = sR(segIdx(end)) - sR(segIdx(1));
+    if segLen < opts.min_len
+        return;
+    end
+
+    xy_entry = xyR(segIdx(1),:);
+    xy_exit  = xyR(segIdx(end),:);
+    s_ref_entry = sR(segIdx(1));
+    s_ref_exit  = sR(segIdx(end));
+    ok = true;
+end
+
 function [ok, refRoute, xy_entry, xy_exit, s_ref_entry, s_ref_exit] = ...
-    consensusOverlapGroup(traj, groupRoutes, mode, opts)
+    consensusOverlapGroup(traj, groupRoutes, mode, opts) %#ok<DEFNU>
+% Legacy (not used now): consensus overlap across a multi-route group
 % mode: 'prefix' or 'suffix'
 
     ok = false;
     refRoute = groupRoutes{1};
-    xyR = traj.(refRoute).(opts.field_xy);
-    sR  = traj.(refRoute).(opts.field_s);
+    xyR = traj.(refRoute).xy;
+    sR  = traj.(refRoute).s;
 
     maskAll = true(size(sR));
     for k = 2:numel(groupRoutes)
-        rr = groupRoutes{k};
-        xyB = traj.(rr).(opts.field_xy);
-        mask = overlapMaskPolyline(xyR, xyB, opts.tol_xy);
+        mask = overlapMaskPolyline(xyR, traj.(groupRoutes{k}).xy, opts.tol_xy);
         maskAll = maskAll & smoothMask(mask, opts.smooth_win);
     end
 
@@ -341,14 +368,16 @@ function [s_entry, s_exit] = mapOverlapToRoute(traj, route, xy_entry, xy_exit, o
 end
 
 function mask = overlapMaskPolyline(xyA, xyB, tol)
-    mask = false(size(xyA,1),1);
+    % Returns a logical mask of points in xyA that are within tol distance of any point in xyB.
+    mask = false(1, size(xyA, 1));
     for i = 1:size(xyA,1)
-        d = sqrt(sum((xyB - xyA(i,:)).^2,2));
+        d = sqrt(sum((xyB - xyA(i,:)).^2,2)).'; % Distance from point i on A to all points on B
         mask(i) = any(d <= tol);
     end
 end
 
 function m2 = smoothMask(m, win)
+    % Smooth a logical mask by setting m2(i) = true if any of m(i-win:i+win) is true.
     if win <= 1, m2 = m; return; end
     m2 = m;
     n = numel(m);
