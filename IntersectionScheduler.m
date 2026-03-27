@@ -19,429 +19,397 @@ classdef IntersectionScheduler < handle
         crossing_d_freeze double = 1.2   % [m] freeze horizon to avoid last-second reorder
         crossing_t_freeze double = 0.6   % [s]
 
+        PlanForEvents
         confirmed
         crossingConfirmed
+
+        % activate crossing reservation when agv is within pre_act_dist of crossing entry
+        pre_act_dist double = 2.0   % [m] gate = s_in - pre_act_dist
+        eventActive  logical
+        t_eventAct   cell   % scheduled activation time (predicted)
+        
+        env
+        agents
+        N_max
+
+        AgvsOnRoute      % 同完整 route 的 AGV id 列表
+        AgvsOnApproach   % 同入口（同共享入口段）的 AGV id 列表
+
+        approachReleaseS % 每条 route 在共享入口段结束的位置（通常取第一个 diverge 的 s_out，没有则为 0
     end
 
     methods
-        function obj = IntersectionScheduler()
-            obj.confirmed = struct('pid', {}, 'agvId', {}, 'route', {}, 't_in', {}, 't_out', {});
+        function obj = IntersectionScheduler(env, agents, N_max)
+            obj.env = env;
+            obj.agents = agents;
+            obj.N_max = N_max;
+
+            obj.confirmed = struct('pid', {}, 'agvId', {}, 'route', {}, 't_in', {}, 't_out', {}, 't_gate', {});
             obj.crossingConfirmed = struct('agvId', {}, 'route', {}, 't_enter', {}, 't_exit', {});
+            num_events = numel(env.Events);
+            obj.PlanForEvents = cell(1, num_events);
+            obj.eventActive = false(1, num_events);
+            obj.t_eventAct = cell(1, num_events);
+
+            for k = 1:num_events
+                obj.PlanForEvents{k} = struct('agvId', {}, 'route', {}, 't_in', {}, 't_out', {}, 't_gate', {});
+            end
+
+            obj.AgvsOnRoute = struct();
+            obj.AgvsOnApproach = struct();
+            obj.approachReleaseS = struct();
+
+            for r = env.routes
+                rr = char(r);
+                obj.AgvsOnRoute.(rr) = [];
+                obj.approachReleaseS.(rr) = obj.computeApproachReleaseS(rr);
+            end
+
+            obj.AgvsOnApproach.N = [];
+            obj.AgvsOnApproach.S = [];
+            obj.AgvsOnApproach.E = [];
+            obj.AgvsOnApproach.W = [];
         end
 
-        function agents = resequenceMergePoints(obj, agents, activeMask, env, t_now)
-            % Resequence only MERGE points based on runtime earliest arrival.
-            %
-            % - Frozen agents (very close to merge) keep their existing slot.
-            % - Flexible agents are reordered by eta_min, then assigned new
-            %   t_in slots with (HEADWAY + t_margin) separation.
-            %
-            % This function updates:
-            %   1) obj.confirmed entries for merge pids
-            %   2) agents(i).plan times (via updatePlanTime)
-
-            if ~obj.merge_reseq_enabled
-                return;
-            end
-            if isempty(agents) || isempty(activeMask) || ~isfield(env,'route_conflicts') || isempty(env.route_conflicts)
-                return;
-            end
-
-            % Collect merge pids
-            mergePids = [];
-            for pid = 1:numel(env.route_conflicts)
-                if isfield(env.route_conflicts(pid),'type') && strcmp(env.route_conflicts(pid).type,'merge')
-                    mergePids(end+1) = pid; %#ok<AGROW>
-                end
-            end
-            if isempty(mergePids)
-                return;
-            end
-
-            for mp = 1:numel(mergePids)
-                pid = mergePids(mp);
-
-                % Candidate agents that have this pid in their plan and haven't passed it
-                candIdx = [];
-                s_pid   = [];
-                etaMin  = [];
-
-                for i = 1:numel(agents)
-                    if ~activeMask(i), continue; end
-                    agv = agents(i);
-                    if isempty(agv.plan) || ~isfield(agv.plan,'pid') || ~isfield(agv.plan,'s')
-                        continue;
+        function idx = findFollowerOnRoute(obj, agv)
+            agvlist = obj.AgvsOnRoute.(agv.route);
+            idx = agvlist.start;
+            agv_id = agv.id;
+            while idx ~= agvlist.end
+                if agvlist.data(idx) == agv_id
+                    idx = idx + 1;
+                    if idx > obj.N_max
+                        idx = 1;
                     end
-
-                    k = find([agv.plan.pid] == pid, 1);
-                    if isempty(k), continue; end
-
-                    sMerge = agv.plan(k).s;
-                    if ~isfinite(sMerge), continue; end
-                    if agv.s >= sMerge - 1e-3
-                        continue; % already passed (or essentially at)
-                    end
-
-                    dTo = max(0.0, sMerge - agv.s);
-                    eta = t_now + obj.etaMinToDistance(dTo, agv.v);
-
-                    candIdx(end+1) = i; %#ok<AGROW>
-                    s_pid(end+1)   = sMerge; %#ok<AGROW>
-                    etaMin(end+1)  = eta; %#ok<AGROW>
-                end
-
-                if numel(candIdx) <= 1
-                    continue;
-                end
-
-                % Split frozen vs flexible
-                frozen = false(size(candIdx));
-                for c = 1:numel(candIdx)
-                    i = candIdx(c);
-                    agv = agents(i);
-                    dTo = max(0.0, s_pid(c) - agv.s);
-                    tTo = max(0.0, etaMin(c) - t_now);
-                    if dTo <= obj.merge_d_freeze || tTo <= obj.merge_t_freeze
-                        frozen(c) = true;
-                    end
-                end
-
-                % Current confirmed records for this pid
-                confIdx = find([obj.confirmed.pid] == pid); %#ok<NASGU>
-
-                % Base timeline from frozen agents (keep their current slots)
-                % If multiple frozen, respect their current t_in ordering.
-                base_t = -inf;
-                if any(frozen)
-                    % Determine frozen slots from agents' current plan (preferred)
-                    fIdx = candIdx(frozen);
-                    fTin = zeros(size(fIdx));
-                    for j = 1:numel(fIdx)
-                        agv = agents(fIdx(j));
-                        k = find([agv.plan.pid] == pid, 1);
-                        fTin(j) = agv.plan(k).t_in;
-                    end
-                    [fTinSorted, ordF] = sort(fTin);
-                    fIdx = fIdx(ordF);
-
-                    % Ensure confirmed entries match frozen (write-through)
-                    for j = 1:numel(fIdx)
-                        agv = agents(fIdx(j));
-                        k = find([agv.plan.pid] == pid, 1);
-                        obj = obj.writeConfirmedForPidAgv(pid, agv.id, agv.route, agv.plan(k).t_in, agv.plan(k).t_out);
-                    end
-
-                    base_t = fTinSorted(end) + Agent.HEADWAY + obj.t_margin;
-                else
-                    base_t = -inf;
-                end
-
-                % Flexible agents: reorder by eta_min
-                flexMask = ~frozen;
-                if ~any(flexMask)
-                    continue;
-                end
-
-                flexIdx = candIdx(flexMask);
-                flexEta = etaMin(flexMask);
-
-                [flexEtaSorted, ord] = sort(flexEta);
-                flexIdx = flexIdx(ord);
-
-                for j = 1:numel(flexIdx)
-                    i = flexIdx(j);
-                    agv = agents(i);
-                    k = find([agv.plan.pid] == pid, 1);
-                    if isempty(k), continue; end
-
-                    t_in_new = max(flexEtaSorted(j), base_t);
-
-                    % Occupancy estimate: keep consistent with planner
-                    occ = (2*obj.d_occ) / max(0.1, min(Agent.V_MAX, max(agv.v, 0.1)));
-                    t_out_new = t_in_new + occ;
-
-                    % Update agent plan (shifts this pid and all downstream points)
-                    agv.updatePlanTime(pid, t_in_new);
-                    obj.syncConfirmedFromPlan(agv);
-
-                    agents(i) = agv;
-
-                    % Update confirmed for this pid + this agv
-                    obj = obj.writeConfirmedForPidAgv(pid, agv.id, agv.route, t_in_new, t_out_new);
-
-                    base_t = t_in_new + Agent.HEADWAY + obj.t_margin;
-                end
-            end
-        end
-
-        function agents = resequenceCrossingPoints(obj, agents, activeMask, env, t_now)
-            % Resequence CROSSING points based on runtime earliest arrival.
-            %
-            % Key behavioral intent:
-            %   - If an upstream delay happens, release the downstream
-            %     reservations (and/or reorder them) so other routes are not
-            %     forced to brake for stale times.
-            %
-            % Policy matches planner rules:
-            %   - Same-route at the same pid: headway separation.
-            %   - Different routes at the same pid: mutual exclusion using
-            %     t_out + margin.
-
-            if ~obj.crossing_reseq_enabled
-                return;
-            end
-            if isempty(agents) || isempty(activeMask) || ~isfield(env,'route_conflicts') || isempty(env.route_conflicts)
-                return;
-            end
-
-            % Collect crossing pids
-            crossPids = [];
-            for pid = 1:numel(env.route_conflicts)
-                if isfield(env.route_conflicts(pid),'type') && strcmp(env.route_conflicts(pid).type,'crossing')
-                    crossPids(end+1) = pid; %#ok<AGROW>
-                end
-            end
-            if isempty(crossPids)
-                return;
-            end
-
-            for cp = 1:numel(crossPids)
-                pid = crossPids(cp);
-
-                % Candidate agents that have this pid in their plan and haven't passed it
-                candIdx = [];
-                s_pid   = [];
-                etaMin  = [];
-
-                for i = 1:numel(agents)
-                    if ~activeMask(i), continue; end
-                    agv = agents(i);
-                    if isempty(agv.plan) || ~isfield(agv.plan,'pid') || ~isfield(agv.plan,'s')
-                        continue;
-                    end
-
-                    k = find([agv.plan.pid] == pid, 1);
-                    if isempty(k), continue; end
-
-                    sCP = agv.plan(k).s;
-                    if ~isfinite(sCP), continue; end
-                    if agv.s >= sCP - 1e-3
-                        continue; % already passed
-                    end
-
-                    dTo = max(0.0, sCP - agv.s);
-                    eta = t_now + obj.etaMinToDistance(dTo, agv.v);
-
-                    candIdx(end+1) = i; %#ok<AGROW>
-                    s_pid(end+1)   = sCP; %#ok<AGROW>
-                    etaMin(end+1)  = eta; %#ok<AGROW>
-                end
-
-                if numel(candIdx) <= 1
-                    continue;
-                end
-
-                % Split frozen vs flexible (avoid last-moment swap)
-                frozen = false(size(candIdx));
-                for c = 1:numel(candIdx)
-                    i = candIdx(c);
-                    agv = agents(i);
-                    dTo = max(0.0, s_pid(c) - agv.s);
-                    tTo = max(0.0, etaMin(c) - t_now);
-                    if dTo <= obj.crossing_d_freeze || tTo <= obj.crossing_t_freeze
-                        frozen(c) = true;
-                    end
-                end
-
-                % Establish current timeline from frozen agents (keep their slots)
-                base_t = -inf;
-                if any(frozen)
-                    fIdx = candIdx(frozen);
-                    fTin = zeros(size(fIdx));
-                    fTout = zeros(size(fIdx));
-                    fRoute = strings(size(fIdx));
-                    for j = 1:numel(fIdx)
-                        agv = agents(fIdx(j));
-                        k = find([agv.plan.pid] == pid, 1);
-                        fTin(j)  = agv.plan(k).t_in;
-                        fTout(j) = agv.plan(k).t_out;
-                        fRoute(j)= string(agv.route);
-                        % ensure confirmed reflects frozen plan
-                        obj.writeConfirmedForPidAgv(pid, agv.id, agv.route, agv.plan(k).t_in, agv.plan(k).t_out);
-                    end
-
-                    % Order frozen by their current t_in, then set base_t using last frozen.
-                    [fTinSorted, ordF] = sort(fTin);
-                    fToutSorted = fTout(ordF);
-                    fRouteSorted = fRoute(ordF); %#ok<NASGU>
-
-                    % base_t depends on last frozen; conservatively use last frozen's t_out.
-                    base_t = fToutSorted(end) + obj.t_margin;
-                else
-                    base_t = -inf;
-                end
-
-                % Flexible agents: order by eta_min
-                flexMask = ~frozen;
-                if ~any(flexMask)
-                    continue;
-                end
-
-                flexIdx = candIdx(flexMask);
-                flexEta = etaMin(flexMask);
-
-                [flexEtaSorted, ord] = sort(flexEta);
-                flexIdx = flexIdx(ord);
-
-                % Greedy scheduling
-                prevRoute = '';
-                prevTout  = -inf;
-                prevTin   = -inf;
-
-                % If we had frozen agents, use their last one as prev.
-                if any(frozen)
-                    existing = obj.confirmed([obj.confirmed.pid] == pid);
-                    if ~isempty(existing)
-                        [~, ix] = max([existing.t_in]);
-                        prevRoute = existing(ix).route;
-                        prevTin   = existing(ix).t_in;
-                        prevTout  = existing(ix).t_out;
-                    end
-                end
-
-                for j = 1:numel(flexIdx)
-                    i = flexIdx(j);
-                    agv = agents(i);
-                    k = find([agv.plan.pid] == pid, 1);
-                    if isempty(k), continue; end
-
-                    t_in_new = flexEtaSorted(j);
-
-                    % Enforce separation from the previously scheduled agent at this pid.
-                    if isfinite(prevTin)
-                        if strcmp(prevRoute, agv.route)
-                            t_in_new = max(t_in_new, prevTin + Agent.HEADWAY + obj.t_margin);
-                        else
-                            t_in_new = max(t_in_new, prevTout + obj.t_margin);
-                        end
-                    end
-
-                    % Also respect base_t from frozen set (safe lower bound)
-                    t_in_new = max(t_in_new, base_t);
-
-                    % Occupancy estimate
-                    v_eff = max(0.1, min(Agent.V_MAX, max(agv.v, 0.1)));
-                    occ = (2*obj.d_occ) / v_eff;
-                    t_out_new = t_in_new + occ; %#ok<NASGU>
-
-                    % Update this agent's plan (shift pid and downstream)
-                    agv.updatePlanTime(pid, t_in_new);
-
-                    % Keep confirmed aligned for all downstream points
-                    obj.syncConfirmedFromPlan(agv);
-                    agents(i) = agv;
-
-                    prevRoute = agv.route;
-                    prevTin   = t_in_new;
-                    prevTout  = t_in_new + occ;
-
-                    % Advance base_t safely (for any remaining)
-                    base_t = prevTout + obj.t_margin;
-                end
-            end
-        end
-
-
-        function [plan, debug] = planForAgent(obj, agv, env, t_now)
-            plan  = struct('pid', {}, 's', {}, 't_in', {}, 't_out', {});
-            debug = struct('shifted', false, 'reason', "", 'delta', 0.0);
-
-            if ~isfield(env.routeEvents, agv.route)
-                return;
-            end
-
-            pids = env.routeEvents.(agv.route).pid;
-            ss   = env.routeEvents.(agv.route).s;
-
-            keep = ss >= agv.s;
-            pids = pids(keep);
-            ss   = ss(keep);
-            if isempty(pids), return; end
-
-            for k = 1:numel(pids)
-                pid  = pids(k);
-                s_cp = ss(k);
-
-                dt  = max(0.0, (s_cp - agv.s) / max(0.1, agv.v));
-                eta = t_now + dt;
-
-                occ = (2*obj.d_occ) / max(0.1, agv.v);
-                e.pid  = pid;
-                e.s    = s_cp;
-                e.t_in = eta;
-                e.t_out = eta + occ;
-                plan(end+1) = e; %#ok<AGROW>
-            end
-
-            % crossing-field gate (route-level)
-            [hasField, kEnter, tEnter, tExit] = obj.getCrossingSpanFromPlan(plan, env, agv.route);
-            if hasField
-                for j = 1:numel(obj.crossingConfirmed)
-                    ce = obj.crossingConfirmed(j);
-                    if strcmp(ce.route, agv.route)
-                        allow_t = ce.t_enter + Agent.HEADWAY + obj.t_margin;
+                    if idx ~= agvlist.end
+                        idx = agvlist.data(idx);
                     else
-                        allow_t = ce.t_exit + obj.t_margin;
+                        idx = NaN;
                     end
+                    return;
+                end
 
-                    if tEnter < allow_t
-                        delta = allow_t - tEnter;
-                        for kk = kEnter:numel(plan)
-                            plan(kk).t_in  = plan(kk).t_in  + delta;
-                            plan(kk).t_out = plan(kk).t_out + delta;
-                        end
-                        debug.shifted = true;
-                        debug.reason = sprintf('crossing-field vs AGV %d (route %s)', ce.agvId, ce.route);
-                        debug.delta = debug.delta + delta;
-
-                        tEnter = tEnter + delta;
-                        tExit  = tExit  + delta;
-                    end
+                idx = idx + 1;
+                if idx > obj.N_max
+                    idx = 1;
                 end
             end
+        end
 
-            % per-point feasibility
+        function agents = tryBindFollowerAfterMakeWay(obj, agents, leaderId, t_now)
+            leader = agents(leaderId);
+
+            % 找同路径后车
+            followerId = obj.findFollowerOnRoute(leader); % the index of the follower
+            if isnan(followerId)
+                return;
+            end
+            follower = agents(followerId);
+
+            % 已经在跟车，则不重复绑定
+            if follower.isFollowing
+                return;
+            end
+
+            % 第0层：快速危险性判定
+            t_check_end = leader.plan(end).time;
+            if t_check_end <= t_now
+                disp("Intersection-tryBindFollowerAfterMakeWay: t_check_end <= t_now.");
+                return;
+            end
+
+            danger = false;
+            t = t_now + Env.DT;
+            while t <= t_check_end
+                [sL, ~, ~] = leader.getStateFromPlan(t);
+                [sF, ~, ~] = follower.getStateFromPlan(t);
+
+                if sL - sF < Agent.D_MIN
+                    danger = true;
+                    break;
+                end
+
+                t = t + Env.DT;
+            end
+
+            if ~danger
+                return;
+            end
+
+            % 第一层+第二层：双层搜索“最晚可行绑定时刻”
+            cand = searchLatestBindingCandidate(leader, follower, t_now);
+
+            if ~cand.ok
+                % 没找到可行解就不绑定，不做硬跳变
+                return;
+            end
+
+            % -------------------------------------------------
+            % 构造 follower 新 plan
+            % -------------------------------------------------
+            ok = buildFollowerBindingPlan(leader, follower, cand, t_now);
+            if ~ok
+                return;
+            end
+
+            % 写回 follower
+            agents(followerId) = follower;
+
+            % 建立绑定关系
+            agents(leaderId).bindFollower(followerId, cand.D);
+            agents(followerId).setLeader(leaderId);
+
+            % nested functions
+            function cand = searchLatestBindingCandidate(leader, follower, t_now)
+                cand = struct( ...
+                    'ok', false, ...
+                    't_bind', NaN, ...
+                    'a_bind', NaN, ...
+                    's_bind', NaN, ...
+                    'v_bind', NaN, ...
+                    'a_ref_bind', NaN, ...
+                    'D', Agent.D_MIN);
+
+                D = Agent.D_MIN;
+
+                t_end = leader.plan(end).time;
+                if t_end <= t_now + Env.DT
+                    return;
+                end
+
+                % ---------- 第一层：粗搜索 ----------
+                coarse_grid = t_now + Env.DT : Env.DT : t_end;
+                hit_idx = NaN;
+
+                for k = numel(coarse_grid):-1:1
+                    tau = coarse_grid(k);
+                    [ok_tmp, ~] = isFeasibleBindTime(leader, follower, t_now, tau, D);
+                    if ok_tmp
+                        hit_idx = k;
+                        break;
+                    end
+                end
+
+                if isnan(hit_idx)
+                    return;
+                end
+
+                % ---------- 第二层：细搜索 ----------
+                if hit_idx == 1
+                    t_l = t_now + Env.DT;
+                else
+                    t_l = coarse_grid(hit_idx - 1);
+                end
+                t_r = coarse_grid(hit_idx);
+
+                n_refine = 10;
+                fine_grid = linspace(t_l, t_r, n_refine + 1);
+
+                best = [];
+                for k = numel(fine_grid):-1:1
+                    tau = fine_grid(k);
+                    [ok_tmp, rec] = isFeasibleBindTime(leader, follower, t_now, tau, D);
+                    if ok_tmp
+                        best = rec;
+                        break;
+                    end
+                end
+
+                if isempty(best)
+                    return;
+                end
+
+                cand.ok         = true;
+                cand.t_bind     = best.t_bind;
+                cand.a_bind     = best.a_bind;
+                cand.s_bind     = best.s_bind;
+                cand.v_bind     = best.v_bind;
+                cand.a_ref_bind = best.a_ref_bind;
+                cand.D          = D;
+            end
+
+            function [ok, rec] = isFeasibleBindTime(leader, follower, t_now, tau, D)
+                rec = struct( ...
+                    't_bind', NaN, ...
+                    'a_bind', NaN, ...
+                    's_bind', NaN, ...
+                    'v_bind', NaN, ...
+                    'a_ref_bind', NaN);
+
+                ok = false;
+
+                dt = tau - t_now;
+                if dt <= 0
+                    return;
+                end
+
+                s0 = follower.s;
+                v0 = follower.v;
+
+                [sL, vL, aL] = leader.getStateFromPlan(tau);
+                s_ref = sL - D;
+                v_ref = vL;
+
+                % 单段常加速度接入
+                a_req = (v_ref - v0) / dt;
+
+                if abs(a_req) > Agent.A_MAX + 1e-12
+                    return;
+                end
+
+                s_hit = s0 + v0 * dt + 0.5 * a_req * dt^2;
+                if abs(s_hit - s_ref) > 1e-2
+                    return;
+                end
+
+                % 检查整个过渡段里是否提前碰撞
+                sub_dt = Env.DT / 10;
+                tt = t_now + sub_dt;
+                while tt <= tau + 1e-12
+                    dtt = tt - t_now;
+                    sF = s0 + v0 * dtt + 0.5 * a_req * dtt^2;
+                    [sL_tmp, ~, ~] = leader.getStateFromPlan(tt);
+
+                    if sL_tmp - sF < D - 1e-3
+                        return;
+                    end
+
+                    tt = tt + sub_dt;
+                end
+
+                rec.t_bind     = tau;
+                rec.a_bind     = a_req;
+                rec.s_bind     = s_ref;
+                rec.v_bind     = v_ref;
+                rec.a_ref_bind = aL;
+                ok = true;
+            end
+
+            function ok = buildFollowerBindingPlan(leader, follower, cand, t_now)
+                ok = false;
+
+                t_bind = cand.t_bind;
+                a_bind = cand.a_bind;
+                s_bind = cand.s_bind;
+                v_bind = cand.v_bind;
+                a_ref  = cand.a_ref_bind;
+                D      = cand.D;
+
+                if isnan(t_bind)
+                    return;
+                end
+
+                dt = t_bind - t_now;
+                if dt <= 0
+                    return;
+                end
+
+                s0 = follower.s;
+                v0 = follower.v;
+
+                s_chk = s0 + v0 * dt + 0.5 * a_bind * dt^2;
+                v_chk = v0 + a_bind * dt;
+
+                if abs(s_chk - s_bind) > 1e-2
+                    return;
+                end
+                if abs(v_chk - v_bind) > 1e-2
+                    return;
+                end
+                if abs(a_bind) > Agent.A_MAX + 1e-12
+                    return;
+                end
+
+                % 彻底重建 follower 的 plan
+                newPlan = struct('time', {}, 'acc', {}, 'v', {}, 'pos', {});
+
+                % t_now 开始按 a_bind 运行
+                newPlan(end + 1) = struct( ...
+                    'time', t_now, ...
+                    'acc',  a_bind, ...
+                    'v',    v0, ...
+                    'pos',  s0);
+
+                % 在 t_bind 接入 leader 偏移轨迹
+                newPlan(end + 1) = struct( ...
+                    'time', t_bind, ...
+                    'acc',  a_ref, ...
+                    'v',    v_bind, ...
+                    'pos',  s_bind);
+
+                % 复制 leader 后续 plan，并整体后移 D
+                idx = find([leader.plan.time] > t_bind);
+                for kk = idx
+                    newPlan(end + 1) = struct( ...
+                        'time', leader.plan(kk).time, ...
+                        'acc',  leader.plan(kk).acc, ...
+                        'v',    leader.plan(kk).v, ...
+                        'pos',  leader.plan(kk).pos - D);
+                end
+
+                % 排序并去掉重复时间点（保留后者）
+                [~, ord] = sort([newPlan.time]);
+                newPlan = newPlan(ord);
+
+                t_all = [newPlan.time];
+                keep = true(size(t_all));
+                for ii = 1:numel(t_all)-1
+                    if abs(t_all(ii+1) - t_all(ii)) < 1e-12
+                        keep(ii) = false;
+                    end
+                end
+                newPlan = newPlan(keep);
+
+                follower.plan = newPlan;
+                follower.a = a_bind;
+
+                ok = true;
+            end
+        end
+
+        function addActivatedEvent(obj, new_line, pid)
+            obj.t_eventAct{pid}(end+1,:) = new_line; %#ok<AGROW>
+            obj.t_eventAct{pid} = sortrows(obj.t_eventAct{pid}, 1);
+            tmp = [obj.t_eventAct{pid}(1, :)];
+            for l = 2:size(obj.t_eventAct{pid}, 1)
+                row = obj.t_eventAct{pid}(l, :);
+                if row(1) < tmp(end, 2)
+                    tmp(end, 2) = max(tmp(end, 2), row(2));
+                else
+                    tmp(end+1, :) = row; %#ok<SAGROW>
+                end
+            end
+            obj.t_eventAct{pid} = tmp;
+        end
+
+        function [hasField, kEnter, tEnter, tExit, sEnter, sExit] = getCrossingSpanFromPlan(~, plan, env, route)
+            %
+            hasField = false;
+            tEnter = NaN; tExit = NaN;
+            sEnter = NaN; sExit = NaN;
+
+            % Look for crossing events in this plan
+            isCross = false(size(plan));
             for k = 1:numel(plan)
                 pid = plan(k).pid;
-                existing = obj.confirmed([obj.confirmed.pid] == pid);
-                if isempty(existing), continue; end
-
-                for j = 1:numel(existing)
-                    ep = existing(j);
-                    ctype = conflictType(ep.route, agv.route);
-
-                    switch ctype
-                        case {"merge","diverge"}
-                            allow_t = ep.t_in + Agent.HEADWAY + obj.t_margin;
-                        otherwise
-                            if strcmp(ep.route, agv.route)
-                                allow_t = ep.t_in + Agent.HEADWAY + obj.t_margin;
-                            else
-                                allow_t = ep.t_out + obj.t_margin;
-                            end
-                    end
-
-                    if plan(k).t_in < allow_t
-                        delta = allow_t - plan(k).t_in;
-                        for kk = k:numel(plan)
-                            plan(kk).t_in  = plan(kk).t_in  + delta;
-                            plan(kk).t_out = plan(kk).t_out + delta;
-                        end
-                        debug.shifted = true;
-                        debug.reason = sprintf('pid %d vs AGV %d (%s)', pid, ep.agvId, ctype);
-                        debug.delta = debug.delta + delta;
-                    end
+                if strcmp(env.route_conflicts(pid).type, 'crossing')
+                    isCross(k) = true;
                 end
+            end
+
+            % If any crossing events, extract the span of the crossing field (enter/exit times and positions)
+            kEnter = NaN; % index of crossing entry in plan
+            if any(isCross)
+                idx = find(isCross);
+                kEnter = idx(1);
+                kExit  = idx(end);
+
+                tEnter = plan(kEnter).t_in;
+                tExit  = plan(kExit).t_out;
+                sEnter = plan(kEnter).s;
+                sExit  = plan(kExit).s;
+
+                hasField = true;
             end
         end
 
@@ -474,52 +442,56 @@ classdef IntersectionScheduler < handle
                 s_exit_field  = NaN;
             end
         end
-
-        function [hasField, kEnter, tEnter, tExit, sEnter, sExit] = getCrossingSpanFromPlan(~, plan, env, route)
-            hasField = false;
-            kEnter = NaN; tEnter = NaN; tExit = NaN;
-            sEnter = NaN; sExit = NaN;
-
-            if isempty(plan) || isempty(env.route_conflicts)
-                return;
-            end
-
-            isCross = false(size(plan));
-            for k = 1:numel(plan)
-                pid = plan(k).pid;
-                if pid < 1 || pid > numel(env.route_conflicts), continue; end
-                if strcmp(env.route_conflicts(pid).type, 'crossing')
-                    isCross(k) = true;
-                end
-            end
-            if ~any(isCross), return; end
-
-            idx = find(isCross);
-            kEnter = idx(1);
-            kExit  = idx(end);
-
-            tEnter = plan(kEnter).t_in;
-            tExit  = plan(kExit).t_out;
-
-            if isfield(plan, 's')
-                sEnter = plan(kEnter).s;
-                sExit  = plan(kExit).s;
-            else
-                if isfield(env.routeEvents, route)
-                    rpid = env.routeEvents.(route).pid;
-                    rs   = env.routeEvents.(route).s;
-                    i1 = find(rpid == plan(kEnter).pid, 1);
-                    i2 = find(rpid == plan(kExit).pid, 1);
-                    if ~isempty(i1), sEnter = rs(i1); end
-                    if ~isempty(i2), sExit  = rs(i2); end
-                end
-            end
-
-            hasField = true;
-        end
     end
 
     methods (Access=private)
+        function [t_in, t_out] = adjustTimeAgainstExisting(obj, pid, agv, env, t_in, s_in, s_out)
+            % Compute conflict-free t_in/t_out for this (pid, agv) given existing plans.
+            % Policy:
+            %   - conflict area must be traversed at V_MAX => t_out = t_in + (s_out-s_in)/V_MAX
+            %   - crossing:
+            %       same route -> headway (based on other.t_in)
+            %       diff route -> mutual exclusion (based on other.t_out)
+            %   - merge/diverge -> headway (based on other.t_in)
+
+            % existing list for this pid
+            occ = max(0.0, (s_out - s_in) / max(0.1, Agent.V_MAX)); % occupancy fixed by V_MAX inside conflict area
+            evList = obj.PlanForEvents{pid};
+            if isempty(evList)
+                t_out = t_in + occ;
+                return;
+            end
+
+            % lower bound imposed by existing plans
+            lb = -inf;
+            for rec = evList
+                if rec.agvId == agv.id
+                    continue;
+                end
+
+                sameRoute = strcmp(rec.route, agv.route);
+
+                if string(env.Events(pid).type) == "crossing"
+                    if sameRoute
+                        % follow: ensure headway separation at entry
+                        lb = max(lb, rec.t_in + Agent.HEADWAY + obj.t_margin);
+                    else
+                        % mutual exclusion: enter after the other leaves
+                        lb = max(lb, rec.t_out + obj.t_margin);
+                    end
+                else
+                    % merge/diverge: headway-based (entry time separation)
+                    lb = max(lb, rec.t_in + Agent.HEADWAY + obj.t_margin);
+                end
+            end
+
+            if isfinite(lb)
+                t_in = max(t_in, lb);
+            end
+
+            t_out = t_in + occ;
+        end
+
         function dt = etaMinToDistance(~, d, v0)
             % Earliest time to cover distance d with accel limit and speed cap.
             d = max(0.0, d);
