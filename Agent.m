@@ -95,6 +95,31 @@ classdef Agent < handle
             return;
         end
 
+        function activate(obj, r, s0, t_now)
+            obj.state = 'activated';
+            obj.route = r;
+            obj.s = s0;
+            obj.v = Agent.V_MAX;
+            obj.a = 0.0;
+
+            obj.plan = struct( ...
+                'time', t_now, ...
+                'acc', 0.0, ...
+                'v', Agent.V_MAX, ...
+                'pos', s0);
+
+            % 清理跟车/编队残留状态（虽然这版不用，但建议保留）
+            obj.platoonNextId  = NaN;
+            obj.platoonGap     = NaN;
+            obj.followLeaderId = NaN;
+            obj.isFollowing    = false;
+
+            % intersection 时序记录（如果你用到了）
+            if isprop(obj, 't_exit_int')
+                obj.t_exit_int = NaN;
+            end
+        end
+
         function obj = makeWay(obj, t_in_old, t_in, t_now)
             tmp = 2 * t_in_old - t_in;
             t1 = floor(tmp / Env.DT) * Env.DT; % 向前取整保证在离散仿真点上
@@ -126,19 +151,20 @@ classdef Agent < handle
         end
 
         function t = getTimeFromPlan(obj, s)
-            idx = 1;
-            for i = 1:numel(obj.plan)
-                if obj.plan(i).pos > s
-                    idx = i - 1;
-                    break;
-                end
+            idx = find([obj.plan.pos] <= s, 1, 'last');
+            if isempty(idx)
+                idx = 1;
             end
+
             rec = obj.plan(idx);
             ds = s - rec.pos;
-            if rec.acc == 0
-                t = rec.time + ds / rec.v;
+
+            if abs(rec.acc) < 1e-12
+                t = rec.time + ds / max(rec.v, 1e-9);
             else
-                t = rec.time + (sqrt(rec.v^2 + 2*rec.acc*ds) - rec.v) / rec.acc;
+                disc = rec.v^2 + 2 * rec.acc * ds;
+                disc = max(disc, 0.0);
+                t = rec.time + (sqrt(disc) - rec.v) / rec.acc;
             end
         end
 
@@ -167,45 +193,14 @@ classdef Agent < handle
 
         function updateStates(obj, t_now)
             % Apply plan-based time caps
+            v_old = obj.v;
             obj.a = obj.plan(find([obj.plan.time] <= t_now, 1, 'last')).acc;
-            obj.v = obj.v + obj.a * Env.DT;
-            obj.v = max(0.0, min(Agent.V_MAX, obj.v));
-            obj.s = obj.s + obj.v * Env.DT;
+            obj.v = max(0.0, min(Agent.V_MAX, v_old + obj.a * Env.DT));
+            obj.s = obj.s + v_old * Env.DT + 0.5 * obj.a * Env.DT^2;
         end
 
         function setPlan(obj, plan)
             obj.plan = plan;
-        end
-
-        function updatePlanTime(obj, pid, new_t_in)
-            idx = find([obj.plan.pid] == pid, 1);
-            if isempty(idx), return; end
-
-            dt = new_t_in - obj.plan(idx).t_in;
-            for k = idx:numel(obj.plan)
-                obj.plan(k).t_in  = obj.plan(k).t_in  + dt;
-                obj.plan(k).t_out = obj.plan(k).t_out + dt;
-            end
-        end
-
-        function activateAgent(obj, r, s0, t_spawn)
-            obj.route = r;
-            obj.state = 'activated';
-            obj.connectedSent = false;
-            obj.plan = struct('pid', {}, 't_in', {}, 't_out', {}, 's_in', {}, 's_out', {}, 'mustVmax', {});
-            obj.t_enter_field = NaN;
-            obj.t_exit_field  = NaN;
-            obj.in_cross_field = false;
-            obj.s = s0;
-            obj.v = Agent.V_MAX;
-            obj.a = 0.0;
-
-            % stats reset
-            obj.t_spawn = t_spawn;
-            obj.t_s0 = NaN;
-            obj.t_exit_int = NaN;
-            obj.t_plan_exit = NaN;
-            obj.t_actual_exit = NaN;
         end
     end
 end

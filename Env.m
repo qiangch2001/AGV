@@ -36,7 +36,7 @@ classdef Env < handle
         Merge      % struct: .pid, .events
         Diverge    % struct: .pid, .events
         RouteIndex % struct: RouteIndex.(route).cross/merge/diverge (pid + s_in/s_out)
-
+        
         n_steps % number of simulation steps
 
         routes; % cell array of route names
