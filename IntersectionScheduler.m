@@ -128,25 +128,72 @@ classdef IntersectionScheduler < handle
             end
         end
 
-        function danger = willFollowerCollideBeforeRelease(obj, leader, follower, t_now, t_release)
+        function danger = willFollowerCollideBeforeRelease(obj, leader, follower, t_now, t_release, gap)
             danger = false;
-            t = t_now + Env.DT;
 
-            while t <= t_release + 1e-12
-                [sL, ~, ~] = leader.getStateFromPlan(t);
-                [sF, ~, ~] = follower.getStateFromPlan(t);
+            t_break = [t_now, t_release, [leader.plan.time], [follower.plan.time]];
+            t_break = unique(sort(t_break));
+            t_break = t_break(t_break >= t_now - 1e-12 & t_break <= t_release + 1e-12);
 
-                if sF > sL - Agent.D_MIN + 1e-6
+            for k = 1:numel(t_break) - 1
+                ta = t_break(k);
+                tb = t_break(k + 1);
+
+                [sL0, vL0, aL] = leader.getStateFromPlan(ta);
+                [sF0, vF0, aF] = follower.getStateFromPlan(ta);
+
+                c0 = sL0 - sF0 - gap;
+                c1 = vL0 - vF0;
+                c2 = aL - aF;
+
+                if c0 < -1e-6
                     danger = true;
                     return;
                 end
 
-                t = t + Env.DT;
+                dt_seg = tb - ta;
+                d_right = c0 + c1 * dt_seg + 0.5 * c2 * dt_seg^2;
+                if d_right < -1e-6
+                    danger = true;
+                    return;
+                end
+
+                if abs(c2) > 1e-12
+                    dt_star = -c1 / c2;
+                    if dt_star > 0 && dt_star < dt_seg
+                        d_star = c0 + c1 * dt_star + 0.5 * c2 * dt_star^2;
+                        if d_star < -1e-6
+                            danger = true;
+                            return;
+                        end
+                    end
+                end
             end
         end
     end
 
     methods (Access=private)
+        function applyRouteBinding(obj, leaderId, followerId, gap)
+            obj.agents(leaderId).bindFollower(followerId, gap);
+            obj.agents(followerId).setLeader(leaderId);
+            obj.agents(followerId).platoonTailGap = 0.0;
+
+            obj.updateUpstreamTailGap(leaderId, gap);
+        end
+
+        function updateUpstreamTailGap(obj, leaderId, deltaGap)
+            curr = leaderId;
+            while true
+                obj.agents(curr).platoonTailGap = obj.agents(curr).platoonTailGap + deltaGap;
+
+                if obj.agents(curr).isFollowing
+                    curr = obj.agents(curr).followLeaderId;
+                else
+                    break;
+                end
+            end
+        end
+
         function pushApproachQueue(obj, route, agv_id)
             % Add AGV to approach queue based on its route's approach
             app = char(route(1));
@@ -237,6 +284,12 @@ classdef IntersectionScheduler < handle
             end
         end
 
+        function ids = findFollowersOnApproach(obj, leaderId)
+            ids_all = obj.queueToVector(obj.AgvsOnApproach.(obj.agents(leaderId).route(1)));
+            pos = find(ids_all == leaderId, 1, 'first');
+            ids = ids_all(pos+1:end);
+        end
+
         function nextId = findNextOnRoute(obj, leaderId)
             ids = obj.queueToVector(obj.AgvsOnRoute.(obj.agents(leaderId).route));
             pos = find(ids == leaderId, 1, 'first') + 1;
@@ -251,24 +304,7 @@ classdef IntersectionScheduler < handle
             leaderRoute   = char(leaderRoute);
             followerRoute = char(followerRoute);
 
-            if strcmp(leaderRoute, followerRoute)
-                releaseLeader   = obj.approachReleaseS.(leaderRoute);
-                releaseFollower = obj.approachReleaseS.(followerRoute);
-                s_release = min(releaseLeader, releaseFollower);
-                return;
-            end
-
-            % 不同 route：优先查 pairwise diverge release
-            if isfield(obj.DivergeRelease, leaderRoute) && ...
-               isfield(obj.DivergeRelease.(leaderRoute), followerRoute)
-                s_release = obj.DivergeRelease.(leaderRoute).(followerRoute);
-                return;
-            end
-
-            % fallback：若没有 pairwise release，则退回老逻辑
-            releaseLeader   = obj.approachReleaseS.(leaderRoute);
-            releaseFollower = obj.approachReleaseS.(followerRoute);
-            s_release = min(releaseLeader, releaseFollower);
+            s_release = obj.DivergeRelease.(leaderRoute).(followerRoute);
         end
 
         function ok = replanFollower(obj, leaderId, followerId, t_now, mode)
@@ -279,15 +315,14 @@ classdef IntersectionScheduler < handle
 
             switch mode
                 case 'approach'
+                    % approach 模式只用于不同 route 的临时跟车
                     s_release = obj.getApproachFollowReleaseS(leader.route, follower.route);
+                    gap = Agent.D_MIN;
 
                 case 'route'
-                    if ~strcmp(leader.route, follower.route)
-                        return;
-                    end
-
-                    routeName = char(leader.route);
-                    s_release = obj.env.traj.(routeName).end_s;
+                    % route 模式只用于同 route 的正式 binding
+                    s_release = obj.env.traj.(char(leader.route)).end_s;
+                    gap = Agent.D_MIN;
             end
 
             if follower.s >= s_release - 1e-9
@@ -299,41 +334,53 @@ classdef IntersectionScheduler < handle
 
             t_release = leader.getTimeFromPlan(s_release);
 
-            if strcmp(mode, 'route') && ~isfinite(t_release)
-                t_release = leader.plan(end).time;
-            end
-
-            if ~isfinite(t_release) || t_release <= t_now + Env.DT
+            if t_release <= t_now + Env.DT
                 return;
             end
 
-            if ~obj.willFollowerCollideBeforeRelease(leader, follower, t_now, t_release)
+            if ~obj.willFollowerCollideBeforeRelease(leader, follower, t_now, t_release, gap)
                 return;
             end
 
-            cand = obj.solveGuaranteedCatchUpCandidate(leader, follower, t_now, t_release);
+            cand = obj.solveGuaranteedCatchUpCandidate(leader, follower, t_now, t_release, gap);
             if ~cand.ok
                 return;
             end
 
-            ok = obj.applyFollowCandidate(leader, follower, cand, t_now, t_release);
+            if strcmp(mode, 'route') && strcmp(cand.mode, 'emergency_stop')
+                obj.applyFollowCandidate(leaderId, followerId, cand, t_now, t_release, 'approach', gap);
+                return;
+            end
+
+            ok = obj.applyFollowCandidate(leaderId, followerId, cand, t_now, t_release, mode, gap);
         end
 
-        function propagateFollowerSlowdown(obj, leaderId, t_now, mode)
+        function propagateInDiverge(obj, leaderId, t_now)
+            followerIds = obj.findFollowersOnApproach(leaderId);
+
+            for k = 1:numel(followerIds)
+                followerId = followerIds(k);
+
+                if strcmp(obj.agents(leaderId).route, obj.agents(followerId).route)
+                    % 同 route：直接正式 binding
+                    obj.replanFollower(leaderId, followerId, t_now, 'route');
+                else
+                    % 不同 route：approach follow
+                    obj.replanFollower(leaderId, followerId, t_now, 'approach');
+                end
+            end
+        end
+
+        function propagateOnRoute(obj, leaderId, t_now)
             currLeaderId = leaderId;
 
             while true
-                switch mode
-                    case 'approach'
-                        followerId = obj.findNextOnApproach(currLeaderId);
-                    case 'route'
-                        followerId = obj.findNextOnRoute(currLeaderId);
-                end
+                followerId = obj.findNextOnRoute(currLeaderId);
                 if isnan(followerId)
                     return;
                 end
 
-                ok = obj.replanFollower(currLeaderId, followerId, t_now, mode);
+                ok = obj.replanFollower(currLeaderId, followerId, t_now, 'route');
                 if ~ok
                     return;
                 end
@@ -369,7 +416,7 @@ classdef IntersectionScheduler < handle
                     end
 
                     % -------- active window overlap: only for event activation bookkeeping --------
-                    if cf.t_out >= t_gate && cf.t_gate < t_out
+                    if ~strcmp(cf.route, agv.route) && cf.t_out >= t_gate && cf.t_gate < t_out
                         obj.addActivatedEvent([max(cf.t_gate, t_gate), min(cf.t_out, t_out)], pid);
                     end
 
@@ -396,11 +443,17 @@ classdef IntersectionScheduler < handle
 
                             if t_in > old_t_in + 1e-9
                                 agv.makeWay(old_t_in, t_in, t_now);
-                                if s_in <= obj.approachReleaseS.(char(agv.route)) + 1e-9
-                                    obj.propagateFollowerSlowdown(agv.id, t_now, 'approach');
-                                end
 
-                                obj.propagateFollowerSlowdown(agv.id, t_now, 'route');
+                                % 如果 makeWay 作用点还在 diverge 总区间内，
+                                % 扫描同 approach 后车：
+                                %   same-route -> route binding
+                                %   different-route -> approach follow
+                                if s_in <= obj.approachReleaseS.(char(agv.route)) + 1e-9
+                                    obj.propagateInDiverge(agv.id, t_now);
+                                else
+                                    % 不在 diverge 内，只需要处理 same-route
+                                    obj.propagateOnRoute(agv.id, t_now);
+                                end
 
                                 agv = obj.agents(agv.id);
                                 t_gate = agv.getTimeFromPlan(s_gate);
@@ -416,7 +469,7 @@ classdef IntersectionScheduler < handle
                         case 'diverge'
                             % diverge: 不在这里做 crossing 式 makeWay
                             % 同 route 已经由 sameRoute 分支处理；
-                            % 不同 route 的共享入口段追尾问题由 propagateApproachSlowdown 负责。
+                            % 不同 route 的共享入口段追尾问题由 propagateInDiverge 负责。
                             continue;
                     end
                 end
@@ -425,14 +478,12 @@ classdef IntersectionScheduler < handle
                 if t_in > t_in_nominal + 1e-9
                     agv.makeWay(t_in_nominal, t_in, t_now);
 
-                    % 共享入口段内的减速：向 approach 后车传播
                     if s_in <= obj.approachReleaseS.(char(agv.route)) + 1e-9
-                        obj.propagateFollowerSlowdown(agv.id, t_now, 'approach');
-                        agv = obj.agents(agv.id);
+                        obj.propagateInDiverge(agv.id, t_now);
+                    else
+                        obj.propagateOnRoute(agv.id, t_now);
                     end
 
-                    % 同 route 上的减速：向 route 后车传播
-                    obj.propagateFollowerSlowdown(agv.id, t_now, 'route');
                     agv = obj.agents(agv.id);
                 end
 
@@ -495,24 +546,50 @@ classdef IntersectionScheduler < handle
                     obj.unregisterAgent(i);
                     obj.active(i) = false;
                     agv.state = 'idle';
+                    agv.platoonNextId  = NaN;
+                    agv.platoonGap     = NaN;
+                    agv.platoonTailGap = 0.0;
+                    agv.followLeaderId = NaN;
+                    agv.isFollowing    = false;
                 end
 
                 obj.agents(i) = agv;
             end
         end
 
-        function ok = applyFollowCandidate(obj, leader, follower, cand, t_now, t_release)
+        function ok = applyFollowCandidate(obj, leaderId, followerId, cand, t_now, t_release, mode, gap)
             ok = false;
+
+            leader = obj.agents(leaderId);
+            follower = obj.agents(followerId);
 
             newPlan = struct('time', {}, 'acc', {}, 'v', {}, 'pos', {});
 
             switch cand.mode
                 case 'direct'
-                    newPlan(end + 1) = struct( ...
-                        'time', t_now, ...
-                        'acc', cand.a_bind, ...
-                        'v', follower.v, ...
-                        'pos', follower.s);
+                    if cand.t_brake > t_now + 1e-12
+                        % 先匀速到 t_brake
+                        s_brake = follower.s + follower.v * (cand.t_brake - t_now);
+
+                        newPlan(end + 1) = struct( ...
+                            'time', t_now, ...
+                            'acc', 0.0, ...
+                            'v', follower.v, ...
+                            'pos', follower.s);
+
+                        newPlan(end + 1) = struct( ...
+                            'time', cand.t_brake, ...
+                            'acc', -Agent.A_MAX, ...
+                            'v', follower.v, ...
+                            'pos', s_brake);
+                    else
+                        % 立即开始最大减速
+                        newPlan(end + 1) = struct( ...
+                            'time', t_now, ...
+                            'acc', -Agent.A_MAX, ...
+                            'v', follower.v, ...
+                            'pos', follower.s);
+                    end
 
                     newPlan(end + 1) = struct( ...
                         'time', cand.t_bind, ...
@@ -573,68 +650,80 @@ classdef IntersectionScheduler < handle
                             'v', 0.0, ...
                             'pos', follower.s);
                     end
-
-                    newPlan(end + 1) = struct( ...
-                        'time', max(cand.t_stop, t_release), ...
-                        'acc', Agent.A_MAX, ...
-                        'v', 0.0, ...
-                        'pos', cand.s_stop);
-
-                otherwise
-                    return;
             end
 
-            if ~strcmp(cand.mode, 'emergency_stop')
-                idx = find([leader.plan.time] > cand.t_bind);
-                for kk = idx
-                    tk = leader.plan(kk).time;
-                    if tk >= t_release
-                        break;
+            switch mode
+                case 'approach'
+                    % 只临时跟到 pairwise release
+                    if ~strcmp(cand.mode, 'emergency_stop')
+                        idx = find([leader.plan.time] > cand.t_bind);
+                        for kk = idx
+                            tk = leader.plan(kk).time;
+                            if tk >= t_release
+                                break;
+                            end
+                            newPlan(end + 1) = struct( ...
+                                'time', tk, ...
+                                'acc', leader.plan(kk).acc, ...
+                                'v', leader.plan(kk).v, ...
+                                'pos', leader.plan(kk).pos - gap);
+                        end
+
+                        [sL_rel, vL_rel, ~] = leader.getStateFromPlan(t_release);
+                        s_rel = sL_rel - gap;
+                        v_rel = vL_rel;
+
+                        if v_rel < Agent.V_MAX - 1e-9
+                            newPlan(end + 1) = struct( ...
+                                'time', t_release, ...
+                                'acc', Agent.A_MAX, ...
+                                'v', v_rel, ...
+                                'pos', s_rel);
+
+                            t_back = t_release + (Agent.V_MAX - v_rel) / Agent.A_MAX;
+                            s_back = s_rel + (Agent.V_MAX^2 - v_rel^2) / (2 * Agent.A_MAX);
+
+                            newPlan(end + 1) = struct( ...
+                                'time', t_back, ...
+                                'acc', 0.0, ...
+                                'v', Agent.V_MAX, ...
+                                'pos', s_back);
+                        else
+                            newPlan(end + 1) = struct( ...
+                                'time', t_release, ...
+                                'acc', 0.0, ...
+                                'v', v_rel, ...
+                                'pos', s_rel);
+                        end
+                    else
+                        t_restart = max(cand.t_stop, t_release);
+                        s_restart = cand.s_stop;
+                        t_back = t_restart + Agent.V_MAX / Agent.A_MAX;
+                        s_back = s_restart + Agent.V_MAX^2 / (2 * Agent.A_MAX);
+
+                        newPlan(end + 1) = struct( ...
+                            'time', t_restart, ...
+                            'acc', Agent.A_MAX, ...
+                            'v', 0.0, ...
+                            'pos', s_restart);
+
+                        newPlan(end + 1) = struct( ...
+                            'time', t_back, ...
+                            'acc', 0.0, ...
+                            'v', Agent.V_MAX, ...
+                            'pos', s_back);
                     end
-                    newPlan(end + 1) = struct( ...
-                        'time', tk, ...
-                        'acc', leader.plan(kk).acc, ...
-                        'v', leader.plan(kk).v, ...
-                        'pos', leader.plan(kk).pos - Agent.D_MIN);
-                end
 
-                [sL_rel, vL_rel, ~] = leader.getStateFromPlan(t_release);
-                s_rel = sL_rel - Agent.D_MIN;
-                v_rel = vL_rel;
-
-                if v_rel < Agent.V_MAX - 1e-9
-                    newPlan(end + 1) = struct( ...
-                        'time', t_release, ...
-                        'acc', Agent.A_MAX, ...
-                        'v', v_rel, ...
-                        'pos', s_rel);
-
-                    t_back = t_release + (Agent.V_MAX - v_rel) / Agent.A_MAX;
-                    s_back = s_rel + (Agent.V_MAX^2 - v_rel^2) / (2 * Agent.A_MAX);
-
-                    newPlan(end + 1) = struct( ...
-                        'time', t_back, ...
-                        'acc', 0.0, ...
-                        'v', Agent.V_MAX, ...
-                        'pos', s_back);
-                else
-                    newPlan(end + 1) = struct( ...
-                        'time', t_release, ...
-                        'acc', 0.0, ...
-                        'v', v_rel, ...
-                        'pos', s_rel);
-                end
-            else
-                t_restart = max(cand.t_stop, t_release);
-                s_restart = cand.s_stop;
-                t_back = t_restart + Agent.V_MAX / Agent.A_MAX;
-                s_back = s_restart + Agent.V_MAX^2 / (2 * Agent.A_MAX);
-
-                newPlan(end + 1) = struct( ...
-                    'time', t_back, ...
-                    'acc', 0.0, ...
-                    'v', Agent.V_MAX, ...
-                    'pos', s_back);
+                case 'route'
+                    % 正式 binding：接入后一直复制 leader 的剩余 plan
+                    idx = find([leader.plan.time] > cand.t_bind);
+                    for kk = idx
+                        newPlan(end + 1) = struct( ...
+                            'time', leader.plan(kk).time, ...
+                            'acc', leader.plan(kk).acc, ...
+                            'v', leader.plan(kk).v, ...
+                            'pos', leader.plan(kk).pos - gap);
+                    end
             end
 
             [~, ord] = sort([newPlan.time]);
@@ -652,351 +741,402 @@ classdef IntersectionScheduler < handle
             follower.plan = newPlan;
             follower.a = newPlan(find([newPlan.time] <= t_now, 1, 'last')).acc;
 
+            obj.agents(followerId) = follower;
+
+            if strcmp(mode, 'route') && ~strcmp(cand.mode, 'emergency_stop')
+                obj.applyRouteBinding(leaderId, followerId, gap);
+            end
+
             ok = true;
         end
 
-        function cand = solveGuaranteedCatchUpCandidate(obj, leader, follower, t_now, t_release)
-            % 通用双层搜索：
-            % 一旦调用，必须返回一个方案
-            %
-            % 输出 cand.mode:
-            %   'direct'         直接单段常加速度接入
-            %   'stop_wait'      先最大减速停下，再等待，再接入
-            %   'emergency_stop' 最大减速停车并等待到 t_release
+        function [ds, t_eq, s_eq, v_eq] = computeGapAtEqualSpeed(obj, leader, follower, t_brake, gap)
 
-            cand = makeEmptyCandidate();
+            v0 = follower.v;
+            s0 = follower.s;
 
-            tau_grid = (t_now + Env.DT) : Env.DT : t_release;
-            if isempty(tau_grid)
-                tau_grid = t_release;
-            elseif abs(tau_grid(end) - t_release) > 1e-12
-                tau_grid(end+1) = t_release; %#ok<AGROW>
+            % 用简单搜索找到等速时间
+            t = t_brake;
+            dt = Env.DT;
+
+            while true
+
+                [sL, vL, ~] = leader.getStateFromPlan(t);
+
+                vF = v0 - Agent.A_MAX*(t - t_brake);
+
+                if vF <= vL
+                    break
+                end
+
+                t = t + dt;
             end
 
-            best = makeEmptyCandidate();
+            t_eq = t;
 
-            % -------------------------
-            % 外层：搜索接入时刻 tau
-            % -------------------------
-            for k = 1:numel(tau_grid)
-                tau = tau_grid(k);
+            dtF = t_eq - t_brake;
 
-                rec1 = evaluateDirectCandidate(tau);
-                best = pickBetter(best, rec1);
+            sF = s0 + v0*(t_brake - 0) ...
+                + v0*dtF - 0.5*Agent.A_MAX*dtF^2;
 
-                rec2 = evaluateStopWaitCandidate(tau);
-                best = pickBetter(best, rec2);
+            s_tar = sL - gap;
+
+            ds = sF - s_tar;
+
+            s_eq = s_tar;
+            v_eq = vL;
+
+        end
+
+        function cand = solveGuaranteedCatchUpCandidate(obj, leader, follower, t_now, t_release, gap)
+
+            tol_t  = Env.DT;
+            tol_s  = 1e-3;
+            max_it = 50;
+
+            cand = struct( ...
+                'ok', false, ...
+                'mode', '', ...
+                't_brake', NaN, ...
+                't_bind', NaN, ...
+                'a_bind', NaN, ...
+                's_bind', NaN, ...
+                'v_bind', NaN, ...
+                'a_ref_bind', NaN, ...
+                't_stop', NaN, ...
+                's_stop', NaN, ...
+                't_depart', NaN);
+
+            % 当前就已经不安全，这种情况说明上游调度逻辑有问题
+            [sL_now, ~, ~] = leader.getStateFromPlan(t_now);
+            if follower.s > sL_now - gap + 1e-6
+                return;
             end
 
-            % 在当前最优解附近细化一次
-            if best.ok && isfinite(best.t_bind)
-                t_l = max(t_now + Env.DT, best.t_bind - Env.DT);
-                t_r = min(t_release,      best.t_bind + Env.DT);
-                fine_grid = linspace(t_l, t_r, 11);
+            % 二分变量：开始最大减速的时刻
+            t_lo = t_now;
+            t_hi = t_release;
 
-                for k = 1:numel(fine_grid)
-                    tau = fine_grid(k);
+            [ok_lo, ds_lo, info_lo] = obj.evaluateDirectCandidateForBrakeTime( ...
+                leader, follower, t_now, t_release, gap, t_lo);
 
-                    rec1 = evaluateDirectCandidate(tau);
-                    best = pickBetter(best, rec1);
+            [ok_hi, ds_hi, info_hi] = obj.evaluateDirectCandidateForBrakeTime( ...
+                leader, follower, t_now, t_release, gap, t_hi);
 
-                    rec2 = evaluateStopWaitCandidate(tau);
-                    best = pickBetter(best, rec2);
+            % 两端正好命中
+            if ok_lo && abs(ds_lo) <= tol_s
+                cand.ok = true;
+                cand.mode = 'direct';
+                cand.t_brake = info_lo.t_brake;
+                cand.t_bind = info_lo.t_bind;
+                cand.a_bind = -Agent.A_MAX;
+                cand.s_bind = info_lo.s_bind;
+                cand.v_bind = info_lo.v_bind;
+                cand.a_ref_bind = info_lo.a_ref_bind;
+                return;
+            end
+
+            if ok_hi && abs(ds_hi) <= tol_s
+                cand.ok = true;
+                cand.mode = 'direct';
+                cand.t_brake = info_hi.t_brake;
+                cand.t_bind = info_hi.t_bind;
+                cand.a_bind = -Agent.A_MAX;
+                cand.s_bind = info_hi.s_bind;
+                cand.v_bind = info_hi.v_bind;
+                cand.a_ref_bind = info_hi.a_ref_bind;
+                return;
+            end
+
+            % 最稳的情况：两端都可评估且误差异号
+            use_bisection = ok_lo && ok_hi && (ds_lo * ds_hi <= 0);
+
+            if use_bisection
+                info_mid = info_lo;
+                ds_mid = ds_lo;
+
+                for it = 1:max_it
+                    t_mid = 0.5 * (t_lo + t_hi);
+
+                    [ok_mid, ds_mid, info_mid] = obj.evaluateDirectCandidateForBrakeTime( ...
+                        leader, follower, t_now, t_release, gap, t_mid);
+
+                    if ~ok_mid
+                        % 保守收缩
+                        t_hi = t_mid;
+                        continue;
+                    end
+
+                    if abs(ds_mid) <= tol_s || (t_hi - t_lo) <= tol_t
+                        cand.ok = true;
+                        cand.mode = 'direct';
+                        cand.t_brake = info_mid.t_brake;
+                        cand.t_bind = info_mid.t_bind;
+                        cand.a_bind = -Agent.A_MAX;
+                        cand.s_bind = info_mid.s_bind;
+                        cand.v_bind = info_mid.v_bind;
+                        cand.a_ref_bind = info_mid.a_ref_bind;
+                        return;
+                    end
+
+                    if ds_lo * ds_mid <= 0
+                        t_hi = t_mid;
+                        ds_hi = ds_mid;
+                    else
+                        t_lo = t_mid;
+                        ds_lo = ds_mid;
+                    end
+                end
+
+                cand.ok = true;
+                cand.mode = 'direct';
+                cand.t_brake = info_mid.t_brake;
+                cand.t_bind = info_mid.t_bind;
+                cand.a_bind = -Agent.A_MAX;
+                cand.s_bind = info_mid.s_bind;
+                cand.v_bind = info_mid.v_bind;
+                cand.a_ref_bind = info_mid.a_ref_bind;
+                return;
+            end
+
+            % 没有异号包围时，取误差绝对值最小的可行点
+            best_ok = false;
+            best_abs_ds = inf;
+            best_info = struct( ...
+                't_brake', NaN, ...
+                't_bind', NaN, ...
+                's_bind', NaN, ...
+                'v_bind', NaN, ...
+                'a_ref_bind', NaN);
+
+            if ok_lo && abs(ds_lo) < best_abs_ds
+                best_ok = true;
+                best_abs_ds = abs(ds_lo);
+                best_info = info_lo;
+            end
+
+            if ok_hi && abs(ds_hi) < best_abs_ds
+                best_ok = true;
+                best_abs_ds = abs(ds_hi);
+                best_info = info_hi;
+            end
+
+            n_probe = 8;
+            for i = 1:n_probe
+                alpha = i / (n_probe + 1);
+                t_try = (1 - alpha) * t_now + alpha * t_release;
+
+                [ok_try, ds_try, info_try] = obj.evaluateDirectCandidateForBrakeTime( ...
+                    leader, follower, t_now, t_release, gap, t_try);
+
+                if ok_try && abs(ds_try) < best_abs_ds
+                    best_ok = true;
+                    best_abs_ds = abs(ds_try);
+                    best_info = info_try;
                 end
             end
 
-            if best.ok
-                cand = best;
+            if best_ok && best_abs_ds <= 5e-2
+                cand.ok = true;
+                cand.mode = 'direct';
+                cand.t_brake = best_info.t_brake;
+                cand.t_bind = best_info.t_bind;
+                cand.a_bind = -Agent.A_MAX;
+                cand.s_bind = best_info.s_bind;
+                cand.v_bind = best_info.v_bind;
+                cand.a_ref_bind = best_info.a_ref_bind;
+                return;
+            end
+
+            % 仍无可接受解，则 emergency_stop
+            v0 = follower.v;
+            t_stop = t_now + v0 / Agent.A_MAX;
+            s_stop = follower.s + v0^2 / (2 * Agent.A_MAX);
+
+            cand.ok = true;
+            cand.mode = 'emergency_stop';
+            cand.t_stop = t_stop;
+            cand.s_stop = s_stop;
+        end
+
+
+        function [ok, ds, info] = evaluateDirectCandidateForBrakeTime(obj, leader, follower, t_now, t_release, gap, t_brake)
+
+            ok = false;
+            ds = NaN;
+            info = struct( ...
+                't_brake', t_brake, ...
+                't_bind', NaN, ...
+                's_bind', NaN, ...
+                'v_bind', NaN, ...
+                'a_ref_bind', NaN);
+
+            % leader 的分段边界
+            t_break = [t_now, t_release, [leader.plan.time]];
+            t_break = unique(sort(t_break));
+            t_break = t_break(t_break >= t_now - 1e-12 & t_break <= t_release + 1e-12);
+
+            for k = 1:numel(t_break) - 1
+                ta = t_break(k);
+                tb = t_break(k + 1);
+
+                [~, vLa, aL] = leader.getStateFromPlan(ta);
+
+                % 在 [ta, tb] 内解析求 vF = vL
+                roots_t = obj.solveEqualSpeedTimesInInterval( ...
+                    follower, t_now, t_brake, ta, tb, vLa, aL);
+
+                if isempty(roots_t)
+                    continue;
+                end
+
+                for r = 1:numel(roots_t)
+                    t_bind = roots_t(r);
+
+                    safe = obj.isBrakeTemplateSafeUntilBind( ...
+                        leader, follower, t_now, gap, t_brake, t_bind);
+
+                    if ~safe
+                        continue;
+                    end
+
+                    [sF, ~, ~] = obj.getFollowerBrakeTemplateState(follower, t_now, t_brake, t_bind);
+                    [sL, vL, aL_bind] = leader.getStateFromPlan(t_bind);
+
+                    s_tar = sL - gap;
+                    ds_here = sF - s_tar;
+
+                    ok = true;
+                    ds = ds_here;
+
+                    info.t_bind = t_bind;
+                    info.s_bind = s_tar;
+                    info.v_bind = vL;
+                    info.a_ref_bind = aL_bind;
+                    return;
+                end
+            end
+        end
+
+
+        function roots_t = solveEqualSpeedTimesInInterval(obj, follower, t_now, t_brake, ta, tb, vLa, aL)
+
+            roots_t = [];
+
+            v0 = follower.v;
+            A  = Agent.A_MAX;
+
+            % 子区间1：匀速段 [ta, min(tb, t_brake)]
+            if ta < t_brake
+                t1a = ta;
+                t1b = min(tb, t_brake);
+
+                % vF = v0
+                % vL = vLa + aL * (t - ta)
+                if abs(aL) > 1e-12
+                    t_root = ta + (v0 - vLa) / aL;
+                    if t_root >= t1a - 1e-12 && t_root <= t1b + 1e-12
+                        roots_t(end + 1) = t_root; %#ok<AGROW>
+                    end
+                else
+                    if abs(v0 - vLa) <= 1e-12
+                        roots_t(end + 1) = t1a; %#ok<AGROW>
+                    end
+                end
+            end
+
+            % 子区间2：减速段 [max(ta, t_brake), tb]
+            if tb > t_brake
+                t2a = max(ta, t_brake);
+                t2b = tb;
+
+                % vF = v0 - A * (t - t_brake)
+                % vL = vLa + aL * (t - ta)
+                denom = A + aL;
+                numer = v0 + A * t_brake - vLa + aL * ta;
+
+                if abs(denom) > 1e-12
+                    t_root = numer / denom;
+                    if t_root >= t2a - 1e-12 && t_root <= t2b + 1e-12
+                        roots_t(end + 1) = t_root; %#ok<AGROW>
+                    end
+                else
+                    val_a = (v0 - A * (t2a - t_brake)) - (vLa + aL * (t2a - ta));
+                    if abs(val_a) <= 1e-12
+                        roots_t(end + 1) = t2a; %#ok<AGROW>
+                    end
+                end
+            end
+
+            if ~isempty(roots_t)
+                roots_t = unique(sort(roots_t));
+            end
+        end
+
+
+        function [s, v, a] = getFollowerBrakeTemplateState(obj, follower, t_now, t_brake, t)
+
+            s0 = follower.s;
+            v0 = follower.v;
+            A  = Agent.A_MAX;
+
+            if t <= t_brake + 1e-12
+                dt = t - t_now;
+                s = s0 + v0 * dt;
+                v = v0;
+                a = 0.0;
             else
-                cand = buildEmergencyStopCandidate();
+                dt1 = t_brake - t_now;
+                s_brake = s0 + v0 * dt1;
+
+                dt2 = t - t_brake;
+                s = s_brake + v0 * dt2 - 0.5 * A * dt2^2;
+                v = v0 - A * dt2;
+                a = -A;
             end
+        end
 
-            % =========================================================
-            function rec = evaluateDirectCandidate(tau)
-                rec = makeEmptyCandidate();
 
-                dt = tau - t_now;
-                if dt <= 1e-12
+        function safe = isBrakeTemplateSafeUntilBind(obj, leader, follower, t_now, gap, t_brake, t_bind)
+
+            safe = true;
+
+            t_break = [t_now, t_bind, t_brake, [leader.plan.time]];
+            t_break = unique(sort(t_break));
+            t_break = t_break(t_break >= t_now - 1e-12 & t_break <= t_bind + 1e-12);
+
+            for k = 1:numel(t_break) - 1
+                ta = t_break(k);
+                tb = t_break(k + 1);
+
+                [sLa, vLa, aL] = leader.getStateFromPlan(ta);
+                [sFa, vFa, aF] = obj.getFollowerBrakeTemplateState(follower, t_now, t_brake, ta);
+
+                % d(dt) = (sL - gap) - sF = c0 + c1 dt + 0.5 c2 dt^2
+                c0 = (sLa - gap) - sFa;
+                c1 = vLa - vFa;
+                c2 = aL - aF;
+
+                dt_seg = tb - ta;
+
+                d_left = c0;
+                d_right = c0 + c1 * dt_seg + 0.5 * c2 * dt_seg^2;
+
+                if d_left < -1e-6 || d_right < -1e-6
+                    safe = false;
                     return;
                 end
 
-                s0 = follower.s;
-                v0 = follower.v;
-
-                [sL, vL, aL] = leader.getStateFromPlan(tau);
-                s_ref = sL - Agent.D_MIN;
-                v_ref = vL;
-
-                a_req = (v_ref - v0) / dt;
-                a_req = max(-Agent.A_MAX, min(Agent.A_MAX, a_req));
-
-                % direct 模式不允许中途先停住再重新起步
-                if a_req < 0
-                    t_to_stop = v0 / max(1e-12, -a_req);
-                    if t_to_stop < dt - 1e-9
-                        return;
+                if abs(c2) > 1e-12
+                    dt_star = -c1 / c2;
+                    if dt_star > 0 && dt_star < dt_seg
+                        d_star = c0 + c1 * dt_star + 0.5 * c2 * dt_star^2;
+                        if d_star < -1e-6
+                            safe = false;
+                            return;
+                        end
                     end
                 end
-
-                s_hit = s0 + v0 * dt + 0.5 * a_req * dt^2;
-                v_hit = v0 + a_req * dt;
-
-                if ~checkDirectSafety(s0, v0, a_req, tau)
-                    return;
-                end
-
-                err_s = s_hit - s_ref;
-                err_v = v_hit - v_ref;
-
-                rec.ok = true;
-                rec.mode = 'direct';
-                rec.t_bind = tau;
-                rec.a_bind = a_req;
-                rec.s_bind = s_hit;
-                rec.v_bind = v_hit;
-                rec.a_ref_bind = aL;
-                rec.err_s = err_s;
-                rec.err_v = err_v;
-                rec.score = candidateScore(err_s, err_v, tau, t_now, 0.0);
-            end
-
-            % =========================================================
-            function rec = evaluateStopWaitCandidate(tau)
-                rec = makeEmptyCandidate();
-
-                s0 = follower.s;
-                v0 = follower.v;
-
-                if v0 <= 1e-12
-                    t_stop = t_now;
-                    s_stop = s0;
-                else
-                    t_brake = v0 / Agent.A_MAX;
-                    t_stop = t_now + t_brake;
-                    s_stop = s0 + v0 * t_brake - 0.5 * Agent.A_MAX * t_brake^2;
-                end
-
-                if t_stop >= tau - 1e-12
-                    return;
-                end
-
-                if ~checkEmergencyBrakeSafety(s0, v0, t_stop)
-                    return;
-                end
-
-                [sL, vL, aL] = leader.getStateFromPlan(tau);
-                s_ref = sL - Agent.D_MIN;
-                v_ref = vL;
-
-                t_dep_grid = t_stop : Env.DT : (tau - Env.DT);
-                if isempty(t_dep_grid)
-                    return;
-                end
-
-                localBest = makeEmptyCandidate();
-
-                for jj = 1:numel(t_dep_grid)
-                    t_depart = t_dep_grid(jj);
-                    dt2 = tau - t_depart;
-                    if dt2 <= 1e-12
-                        continue;
-                    end
-
-                    a_go = v_ref / dt2;
-                    a_go = max(0.0, min(Agent.A_MAX, a_go));
-
-                    s_hit = s_stop + 0.5 * a_go * dt2^2;
-                    v_hit = a_go * dt2;
-
-                    if ~checkStopWaitSafety(s0, v0, t_stop, s_stop, t_depart, a_go, tau)
-                        continue;
-                    end
-
-                    err_s = s_hit - s_ref;
-                    err_v = v_hit - v_ref;
-
-                    tmp = makeEmptyCandidate();
-                    tmp.ok = true;
-                    tmp.mode = 'stop_wait';
-                    tmp.t_stop = t_stop;
-                    tmp.s_stop = s_stop;
-                    tmp.t_depart = t_depart;
-                    tmp.t_bind = tau;
-                    tmp.a_bind = a_go;
-                    tmp.s_bind = s_hit;
-                    tmp.v_bind = v_hit;
-                    tmp.a_ref_bind = aL;
-                    tmp.err_s = err_s;
-                    tmp.err_v = err_v;
-                    tmp.score = candidateScore(err_s, err_v, tau, t_now, t_depart - t_now);
-
-                    localBest = pickBetter(localBest, tmp);
-                end
-
-                rec = localBest;
-            end
-
-            % =========================================================
-            function rec = buildEmergencyStopCandidate()
-                rec = makeEmptyCandidate();
-
-                s0 = follower.s;
-                v0 = follower.v;
-
-                if v0 <= 1e-12
-                    t_stop = t_now;
-                    s_stop = s0;
-                else
-                    t_brake = v0 / Agent.A_MAX;
-                    t_stop = t_now + t_brake;
-                    s_stop = s0 + v0 * t_brake - 0.5 * Agent.A_MAX * t_brake^2;
-                end
-
-                rec.ok = true;
-                rec.mode = 'emergency_stop';
-                rec.t_stop = t_stop;
-                rec.s_stop = s_stop;
-                rec.t_bind = t_release;
-                rec.a_bind = 0.0;
-                rec.s_bind = s_stop;
-                rec.v_bind = 0.0;
-                rec.a_ref_bind = 0.0;
-                rec.err_s = inf;
-                rec.err_v = inf;
-                rec.score = 1e12;
-            end
-
-            % =========================================================
-            function tf = checkDirectSafety(s0, v0, a_req, tau)
-                tf = true;
-                sub_dt = Env.DT / 10;
-                tt = t_now + sub_dt;
-
-                while tt <= tau + 1e-12
-                    dtt = tt - t_now;
-                    sF = s0 + v0 * dtt + 0.5 * a_req * dtt^2;
-                    [sL_tmp, ~, ~] = leader.getStateFromPlan(tt);
-
-                    if sF > sL_tmp - Agent.D_MIN + 1e-6
-                        tf = false;
-                        return;
-                    end
-                    tt = tt + sub_dt;
-                end
-            end
-
-            % =========================================================
-            function tf = checkEmergencyBrakeSafety(s0, v0, t_stop)
-                tf = true;
-
-                if t_stop <= t_now + 1e-12
-                    [sL_now, ~, ~] = leader.getStateFromPlan(t_now);
-                    tf = (s0 <= sL_now - Agent.D_MIN + 1e-6);
-                    return;
-                end
-
-                sub_dt = Env.DT / 10;
-                tt = t_now + sub_dt;
-
-                while tt <= t_stop + 1e-12
-                    dtt = tt - t_now;
-                    sF = s0 + v0 * dtt - 0.5 * Agent.A_MAX * dtt^2;
-                    [sL_tmp, ~, ~] = leader.getStateFromPlan(tt);
-
-                    if sF > sL_tmp - Agent.D_MIN + 1e-6
-                        tf = false;
-                        return;
-                    end
-                    tt = tt + sub_dt;
-                end
-            end
-
-            % =========================================================
-            function tf = checkStopWaitSafety(s0, v0, t_stop, s_stop, t_depart, a_go, tau)
-                tf = true;
-                sub_dt = Env.DT / 10;
-
-                % braking
-                tt = t_now + sub_dt;
-                while tt <= t_stop + 1e-12
-                    dtt = tt - t_now;
-                    sF = s0 + v0 * dtt - 0.5 * Agent.A_MAX * dtt^2;
-                    [sL_tmp, ~, ~] = leader.getStateFromPlan(tt);
-                    if sF > sL_tmp - Agent.D_MIN + 1e-6
-                        tf = false;
-                        return;
-                    end
-                    tt = tt + sub_dt;
-                end
-
-                % wait
-                tt = t_stop + sub_dt;
-                while tt <= t_depart + 1e-12
-                    [sL_tmp, ~, ~] = leader.getStateFromPlan(tt);
-                    if s_stop > sL_tmp - Agent.D_MIN + 1e-6
-                        tf = false;
-                        return;
-                    end
-                    tt = tt + sub_dt;
-                end
-
-                % accelerate to bind
-                tt = t_depart + sub_dt;
-                while tt <= tau + 1e-12
-                    dtt = tt - t_depart;
-                    sF = s_stop + 0.5 * a_go * dtt^2;
-                    [sL_tmp, ~, ~] = leader.getStateFromPlan(tt);
-                    if sF > sL_tmp - Agent.D_MIN + 1e-6
-                        tf = false;
-                        return;
-                    end
-                    tt = tt + sub_dt;
-                end
-            end
-
-            % =========================================================
-            function score = candidateScore(err_s, err_v, tau, t_now, extra_wait)
-                score = ...
-                    20.0 * abs(err_s) + ...
-                    4.0 * abs(err_v) - ...
-                    0.10 * (tau - t_now) + ...
-                    0.02 * max(0.0, extra_wait);
-            end
-
-            % =========================================================
-            function best = pickBetter(best, rec)
-                if ~rec.ok
-                    return;
-                end
-                if ~best.ok
-                    best = rec;
-                    return;
-                end
-                if rec.score < best.score - 1e-12
-                    best = rec;
-                    return;
-                end
-                if abs(rec.score - best.score) <= 1e-12 && rec.t_bind > best.t_bind
-                    best = rec;
-                end
-            end
-
-            % =========================================================
-            function rec = makeEmptyCandidate()
-                rec = struct( ...
-                    'ok', false, ...
-                    'mode', 'none', ...
-                    'score', inf, ...
-                    't_bind', NaN, ...
-                    'a_bind', NaN, ...
-                    's_bind', NaN, ...
-                    'v_bind', NaN, ...
-                    'a_ref_bind', NaN, ...
-                    'err_s', inf, ...
-                    'err_v', inf, ...
-                    't_stop', NaN, ...
-                    's_stop', NaN, ...
-                    't_depart', NaN);
             end
         end
 

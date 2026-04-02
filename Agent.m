@@ -57,6 +57,7 @@ classdef Agent < handle
         
         platoonNextId   = NaN;
         platoonGap      = NaN;
+        platoonTailGap  = 0.0;
         t_exit
 
         followLeaderId = NaN;      % 如果是跟车状态，记录前车 id
@@ -90,6 +91,7 @@ classdef Agent < handle
 
             obj.platoonNextId = NaN;
             obj.platoonGap = NaN;
+            obj.platoonTailGap = 0.0;
             obj.followLeaderId = NaN;
             obj.isFollowing = false;
             return;
@@ -108,9 +110,9 @@ classdef Agent < handle
                 'v', Agent.V_MAX, ...
                 'pos', s0);
 
-            % 清理跟车/编队残留状态（虽然这版不用，但建议保留）
             obj.platoonNextId  = NaN;
             obj.platoonGap     = NaN;
+            obj.platoonTailGap = 0.0;
             obj.followLeaderId = NaN;
             obj.isFollowing    = false;
 
@@ -179,6 +181,10 @@ classdef Agent < handle
         function bindFollower(obj, followerId, gap)
             obj.platoonNextId = followerId;
             obj.platoonGap = gap;
+        end
+
+        function setPlatoonTailGap(obj, gap)
+            obj.platoonTailGap = gap;
         end
 
         function setLeader(obj, leaderId)
