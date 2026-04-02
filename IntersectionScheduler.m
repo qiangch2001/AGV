@@ -181,6 +181,33 @@ classdef IntersectionScheduler < handle
             obj.updateUpstreamTailGap(leaderId, gap);
         end
 
+function refreshRouteFollowerPlan(obj, leaderId, followerId, t_now, gap)
+    leader   = obj.agents(leaderId);
+    follower = obj.agents(followerId);
+
+    [~, ~, aL_now] = leader.getStateFromPlan(t_now);
+
+    newPlan = struct('time', {}, 'acc', {}, 'v', {}, 'pos', {});
+    newPlan(1) = struct( ...
+        'time', t_now, ...
+        'acc',  aL_now, ...
+        'v',    follower.v, ...
+        'pos',  follower.s);
+
+    idx = find([leader.plan.time] > t_now + 1e-12);
+    for kk = idx
+        newPlan(end + 1) = struct( ...
+            'time', leader.plan(kk).time, ...
+            'acc',  leader.plan(kk).acc, ...
+            'v',    leader.plan(kk).v, ...
+            'pos',  leader.plan(kk).pos - gap);
+    end
+
+    follower.plan = newPlan;
+    follower.a    = newPlan(1).acc;
+    obj.agents(followerId) = follower;
+end
+
         function updateUpstreamTailGap(obj, leaderId, deltaGap)
             curr = leaderId;
             while true
@@ -315,12 +342,10 @@ classdef IntersectionScheduler < handle
 
             switch mode
                 case 'approach'
-                    % approach 模式只用于不同 route 的临时跟车
                     s_release = obj.getApproachFollowReleaseS(leader.route, follower.route);
                     gap = Agent.D_MIN;
 
                 case 'route'
-                    % route 模式只用于同 route 的正式 binding
                     s_release = obj.env.traj.(char(leader.route)).end_s;
                     gap = Agent.D_MIN;
             end
@@ -333,8 +358,13 @@ classdef IntersectionScheduler < handle
             end
 
             t_release = leader.getTimeFromPlan(s_release);
-
             if t_release <= t_now + Env.DT
+                return;
+            end
+
+            if strcmp(mode, 'route') && follower.isFollowing && follower.followLeaderId == leaderId
+                obj.refreshRouteFollowerPlan(leaderId, followerId, t_now, gap);
+                ok = true;
                 return;
             end
 
@@ -354,6 +384,7 @@ classdef IntersectionScheduler < handle
 
             ok = obj.applyFollowCandidate(leaderId, followerId, cand, t_now, t_release, mode, gap);
         end
+
 
         function propagateInDiverge(obj, leaderId, t_now)
             followerIds = obj.findFollowersOnApproach(leaderId);
@@ -788,235 +819,337 @@ classdef IntersectionScheduler < handle
 
         end
 
-        function cand = solveGuaranteedCatchUpCandidate(obj, leader, follower, t_now, t_release, gap)
+function cand = solveGuaranteedCatchUpCandidate(obj, leader, follower, t_now, t_release, gap)
 
-            tol_t  = Env.DT;
-            tol_s  = 1e-3;
-            max_it = 50;
+    A = Agent.A_MAX;
+    V = Agent.V_MAX;
 
-            cand = struct( ...
-                'ok', false, ...
-                'mode', '', ...
-                't_brake', NaN, ...
-                't_bind', NaN, ...
-                'a_bind', NaN, ...
-                's_bind', NaN, ...
-                'v_bind', NaN, ...
-                'a_ref_bind', NaN, ...
-                't_stop', NaN, ...
-                's_stop', NaN, ...
-                't_depart', NaN);
+    cand = struct( ...
+        'ok', false, ...
+        'mode', '', ...
+        't_brake', NaN, ...
+        't_bind', NaN, ...
+        'a_bind', NaN, ...
+        's_bind', NaN, ...
+        'v_bind', NaN, ...
+        'a_ref_bind', NaN, ...
+        't_stop', NaN, ...
+        's_stop', NaN, ...
+        't_depart', NaN);
 
-            % 当前就已经不安全，这种情况说明上游调度逻辑有问题
-            [sL_now, ~, ~] = leader.getStateFromPlan(t_now);
-            if follower.s > sL_now - gap + 1e-6
-                return;
-            end
+    % ---------- 当前参考路径 ----------
+    [sL_now, ~, ~] = leader.getStateFromPlan(t_now);
+    s_ref_now = sL_now - gap;
 
-            % 二分变量：开始最大减速的时刻
-            t_lo = t_now;
-            t_hi = t_release;
+    if follower.s > s_ref_now + 1e-6
+        return;
+    end
 
-            [ok_lo, ds_lo, info_lo] = obj.evaluateDirectCandidateForBrakeTime( ...
-                leader, follower, t_now, t_release, gap, t_lo);
+    % ---------- leader brake profile ----------
+    info = obj.getLeaderBrakeProfileForBinding(leader, t_now, t_release);
 
-            [ok_hi, ds_hi, info_hi] = obj.evaluateDirectCandidateForBrakeTime( ...
-                leader, follower, t_now, t_release, gap, t_hi);
+    if ~info.ok
+        v0 = follower.v;
+        cand.ok = true;
+        cand.mode = 'emergency_stop';
+        cand.t_stop = t_now + v0 / A;
+        cand.s_stop = follower.s + v0^2 / (2*A);
+        return;
+    end
 
-            % 两端正好命中
-            if ok_lo && abs(ds_lo) <= tol_s
-                cand.ok = true;
-                cand.mode = 'direct';
-                cand.t_brake = info_lo.t_brake;
-                cand.t_bind = info_lo.t_bind;
-                cand.a_bind = -Agent.A_MAX;
-                cand.s_bind = info_lo.s_bind;
-                cand.v_bind = info_lo.v_bind;
-                cand.a_ref_bind = info_lo.a_ref_bind;
-                return;
-            end
+    t_ref_brake = info.t_brake_ref;
+    t_ref_decel_end = info.t_decel_end;
+    v1 = info.v1;
 
-            if ok_hi && abs(ds_hi) <= tol_s
-                cand.ok = true;
-                cand.mode = 'direct';
-                cand.t_brake = info_hi.t_brake;
-                cand.t_bind = info_hi.t_bind;
-                cand.a_bind = -Agent.A_MAX;
-                cand.s_bind = info_hi.s_bind;
-                cand.v_bind = info_hi.v_bind;
-                cand.a_ref_bind = info_hi.a_ref_bind;
-                return;
-            end
+    dv = V - v1;
 
-            % 最稳的情况：两端都可评估且误差异号
-            use_bisection = ok_lo && ok_hi && (ds_lo * ds_hi <= 0);
+    if dv <= 1e-9
+        return;
+    end
 
-            if use_bisection
-                info_mid = info_lo;
-                ds_mid = ds_lo;
+    % ---------- follower 与理想路径距离 ----------
+    ds = follower.s - s_ref_now;
 
-                for it = 1:max_it
-                    t_mid = 0.5 * (t_lo + t_hi);
+    % ---------- 解析时间偏移 ----------
+    dt_shift = ds / dv;
 
-                    [ok_mid, ds_mid, info_mid] = obj.evaluateDirectCandidateForBrakeTime( ...
-                        leader, follower, t_now, t_release, gap, t_mid);
+    t_brake = t_ref_brake - dt_shift;
+    t_bind  = t_ref_decel_end - dt_shift;
 
-                    if ~ok_mid
-                        % 保守收缩
-                        t_hi = t_mid;
-                        continue;
-                    end
+    if t_bind > t_release
+        t_bind = t_release;
+    end
 
-                    if abs(ds_mid) <= tol_s || (t_hi - t_lo) <= tol_t
-                        cand.ok = true;
-                        cand.mode = 'direct';
-                        cand.t_brake = info_mid.t_brake;
-                        cand.t_bind = info_mid.t_bind;
-                        cand.a_bind = -Agent.A_MAX;
-                        cand.s_bind = info_mid.s_bind;
-                        cand.v_bind = info_mid.v_bind;
-                        cand.a_ref_bind = info_mid.a_ref_bind;
-                        return;
-                    end
+    % ---------- 确保减速开始不早于当前 ----------
+    if t_brake < t_now
+        t_brake = t_now;
+    end
 
-                    if ds_lo * ds_mid <= 0
-                        t_hi = t_mid;
-                        ds_hi = ds_mid;
-                    else
-                        t_lo = t_mid;
-                        ds_lo = ds_mid;
-                    end
-                end
+    % ======================================================
+    % 全过程安全校验
+    % ======================================================
 
-                cand.ok = true;
-                cand.mode = 'direct';
-                cand.t_brake = info_mid.t_brake;
-                cand.t_bind = info_mid.t_bind;
-                cand.a_bind = -Agent.A_MAX;
-                cand.s_bind = info_mid.s_bind;
-                cand.v_bind = info_mid.v_bind;
-                cand.a_ref_bind = info_mid.a_ref_bind;
-                return;
-            end
+    while true
 
-            % 没有异号包围时，取误差绝对值最小的可行点
-            best_ok = false;
-            best_abs_ds = inf;
-            best_info = struct( ...
-                't_brake', NaN, ...
-                't_bind', NaN, ...
-                's_bind', NaN, ...
-                'v_bind', NaN, ...
-                'a_ref_bind', NaN);
+        safe = obj.isReferenceCatchupSafe( ...
+            leader, follower, t_now, t_brake, t_bind, gap);
 
-            if ok_lo && abs(ds_lo) < best_abs_ds
-                best_ok = true;
-                best_abs_ds = abs(ds_lo);
-                best_info = info_lo;
-            end
+        if safe
+            break
+        end
 
-            if ok_hi && abs(ds_hi) < best_abs_ds
-                best_ok = true;
-                best_abs_ds = abs(ds_hi);
-                best_info = info_hi;
-            end
+        % 如果不安全，则提前减速
+        t_brake = t_brake - Env.DT;
 
-            n_probe = 8;
-            for i = 1:n_probe
-                alpha = i / (n_probe + 1);
-                t_try = (1 - alpha) * t_now + alpha * t_release;
-
-                [ok_try, ds_try, info_try] = obj.evaluateDirectCandidateForBrakeTime( ...
-                    leader, follower, t_now, t_release, gap, t_try);
-
-                if ok_try && abs(ds_try) < best_abs_ds
-                    best_ok = true;
-                    best_abs_ds = abs(ds_try);
-                    best_info = info_try;
-                end
-            end
-
-            if best_ok && best_abs_ds <= 5e-2
-                cand.ok = true;
-                cand.mode = 'direct';
-                cand.t_brake = best_info.t_brake;
-                cand.t_bind = best_info.t_bind;
-                cand.a_bind = -Agent.A_MAX;
-                cand.s_bind = best_info.s_bind;
-                cand.v_bind = best_info.v_bind;
-                cand.a_ref_bind = best_info.a_ref_bind;
-                return;
-            end
-
-            % 仍无可接受解，则 emergency_stop
+        if t_brake < t_now
             v0 = follower.v;
-            t_stop = t_now + v0 / Agent.A_MAX;
-            s_stop = follower.s + v0^2 / (2 * Agent.A_MAX);
-
             cand.ok = true;
             cand.mode = 'emergency_stop';
-            cand.t_stop = t_stop;
-            cand.s_stop = s_stop;
+            cand.t_stop = t_now + v0/A;
+            cand.s_stop = follower.s + v0^2/(2*A);
+            return;
         end
 
+        t_bind = t_bind - Env.DT;
 
-        function [ok, ds, info] = evaluateDirectCandidateForBrakeTime(obj, leader, follower, t_now, t_release, gap, t_brake)
+    end
 
+    % ---------- 得到最终绑定状态 ----------
+    [sL_bind, vL_bind, aL_bind] = leader.getStateFromPlan(t_bind);
+
+    cand.ok = true;
+    cand.mode = 'direct';
+    cand.t_brake = t_brake;
+    cand.t_bind = t_bind;
+    cand.a_bind = -A;
+    cand.s_bind = sL_bind - gap;
+    cand.v_bind = vL_bind;
+    cand.a_ref_bind = aL_bind;
+
+end
+
+function ok = isReferenceCatchupSafe(obj, leader, follower, t_now, t_brake, t_bind, gap)
+
+    ok = true;
+
+    ts = t_now : Env.DT : t_bind;
+
+    if isempty(ts) || ts(end) < t_bind
+        ts(end+1) = t_bind;
+    end
+
+    for i = 1:length(ts)
+
+        t = ts(i);
+
+        % follower轨迹
+        if t <= t_brake
+
+            sF = follower.s + follower.v*(t - t_now);
+
+        else
+
+            dt1 = t_brake - t_now;
+            s1 = follower.s + follower.v*dt1;
+
+            dt2 = t - t_brake;
+
+            sF = s1 + follower.v*dt2 - 0.5*Agent.A_MAX*dt2^2;
+
+        end
+
+        [sL,~,~] = leader.getStateFromPlan(t);
+
+        s_ref = sL - gap;
+
+        if sF > s_ref + 1e-6
             ok = false;
-            ds = NaN;
-            info = struct( ...
-                't_brake', t_brake, ...
-                't_bind', NaN, ...
-                's_bind', NaN, ...
-                'v_bind', NaN, ...
-                'a_ref_bind', NaN);
+            return;
+        end
 
-            % leader 的分段边界
-            t_break = [t_now, t_release, [leader.plan.time]];
-            t_break = unique(sort(t_break));
-            t_break = t_break(t_break >= t_now - 1e-12 & t_break <= t_release + 1e-12);
+    end
 
-            for k = 1:numel(t_break) - 1
-                ta = t_break(k);
-                tb = t_break(k + 1);
+end
 
-                [~, vLa, aL] = leader.getStateFromPlan(ta);
+function info = getLeaderBrakeProfileForBinding(obj, leader, t_now, t_release)
 
-                % 在 [ta, tb] 内解析求 vF = vL
-                roots_t = obj.solveEqualSpeedTimesInInterval( ...
-                    follower, t_now, t_brake, ta, tb, vLa, aL);
+    info = struct( ...
+        'ok', false, ...
+        't_brake_ref', NaN, ...
+        't_decel_end', NaN, ...
+        't_accel_start', NaN, ...
+        'v1', NaN);
 
-                if isempty(roots_t)
-                    continue;
-                end
+    p = leader.plan;
+    n = numel(p);
+    if n < 2
+        return;
+    end
 
-                for r = 1:numel(roots_t)
-                    t_bind = roots_t(r);
+    % 找 t_now 之后第一次进入负加速度的 plan 记录
+    idx_brake = NaN;
+    for k = 1:n
+        if p(k).time < t_now - 1e-9
+            continue;
+        end
+        if p(k).time > t_release + 1e-9
+            break;
+        end
+        if p(k).acc < -1e-9
+            idx_brake = k;
+            break;
+        end
+    end
 
-                    safe = obj.isBrakeTemplateSafeUntilBind( ...
-                        leader, follower, t_now, gap, t_brake, t_bind);
+    if isnan(idx_brake)
+        return;
+    end
 
-                    if ~safe
-                        continue;
-                    end
+    t_brake_ref = p(idx_brake).time;
 
-                    [sF, ~, ~] = obj.getFollowerBrakeTemplateState(follower, t_now, t_brake, t_bind);
-                    [sL, vL, aL_bind] = leader.getStateFromPlan(t_bind);
+    % 从该处往后找减速结束（第一次 acc 不再为负）
+    idx_end = NaN;
+    for k = idx_brake + 1:n
+        if p(k).time > t_release + 1e-9
+            break;
+        end
+        if p(k).acc >= -1e-9
+            idx_end = k;
+            break;
+        end
+    end
 
-                    s_tar = sL - gap;
-                    ds_here = sF - s_tar;
+    if isnan(idx_end)
+        % 若没找到，就用最后一个有效 plan 点
+        idx_end = n;
+    end
 
-                    ok = true;
-                    ds = ds_here;
+    t_decel_end = p(idx_end).time;
+    [~, v1, ~] = leader.getStateFromPlan(t_decel_end);
 
-                    info.t_bind = t_bind;
-                    info.s_bind = s_tar;
-                    info.v_bind = vL;
-                    info.a_ref_bind = aL_bind;
-                    return;
-                end
+    % 再往后找第一次重新加速
+    idx_acc = NaN;
+    for k = idx_end:n
+        if p(k).time > t_release + 1e-9
+            break;
+        end
+        if p(k).acc > 1e-9
+            idx_acc = k;
+            break;
+        end
+    end
+
+    if isnan(idx_acc)
+        t_accel_start = NaN;
+    else
+        t_accel_start = p(idx_acc).time;
+    end
+
+    info.ok = true;
+    info.t_brake_ref = t_brake_ref;
+    info.t_decel_end = t_decel_end;
+    info.t_accel_start = t_accel_start;
+    info.v1 = v1;
+end
+
+function A_loss = computeReferenceLossAreaSegment(obj, leader, t_a, t_b)
+
+    A_loss = 0.0;
+    if t_b <= t_a
+        return;
+    end
+
+    V = Agent.V_MAX;
+
+    % 用 plan 分段积分：∫ (V - v_ref(t)) dt
+    p = leader.plan;
+    ts = [t_a, [p.time], t_b];
+    ts = unique(sort(ts));
+    ts = ts(ts >= t_a - 1e-9 & ts <= t_b + 1e-9);
+
+    for i = 1:numel(ts)-1
+        ta = ts(i);
+        tb = ts(i+1);
+        if tb <= ta + 1e-12
+            continue;
+        end
+
+        [~, va, ~] = leader.getStateFromPlan(ta);
+        [~, vb, ~] = leader.getStateFromPlan(tb);
+
+        % 线性速度段梯形积分
+        A_loss = A_loss + (V - 0.5 * (va + vb)) * (tb - ta);
+    end
+end
+
+
+function [ok, ds, info] = evaluateDirectCandidateForBrakeTime(obj, leader, follower, t_now, t_release, gap, t_brake)
+
+    ok = false;
+    ds = NaN;
+    info = struct( ...
+        't_brake', t_brake, ...
+        't_bind', NaN, ...
+        's_bind', NaN, ...
+        'v_bind', NaN, ...
+        'a_ref_bind', NaN);
+
+    t_break = [t_now, t_release, [leader.plan.time]];
+    t_break = unique(sort(t_break));
+    t_break = t_break(t_break >= t_now - 1e-12 & t_break <= t_release + 1e-12);
+
+    best_abs_ds = inf;
+    best_info = info;
+    best_signed_ds = NaN;
+
+    for k = 1:numel(t_break) - 1
+        ta = t_break(k);
+        tb = t_break(k + 1);
+
+        [~, vLa, aL] = leader.getStateFromPlan(ta);
+
+        roots_t = obj.solveEqualSpeedTimesInInterval( ...
+            follower, t_now, t_brake, ta, tb, vLa, aL);
+
+        if isempty(roots_t)
+            continue;
+        end
+
+        for r = 1:numel(roots_t)
+            t_bind = roots_t(r);
+
+            safe = obj.isBrakeTemplateSafeUntilBind( ...
+                leader, follower, t_now, gap, t_brake, t_bind);
+
+            if ~safe
+                continue;
+            end
+
+            [sF, ~, ~] = obj.getFollowerBrakeTemplateState(follower, t_now, t_brake, t_bind);
+            [sL, vL, aL_bind] = leader.getStateFromPlan(t_bind);
+
+            s_tar = sL - gap;
+            ds_here = sF - s_tar;
+            abs_ds_here = abs(ds_here);
+
+            if abs_ds_here < best_abs_ds - 1e-12 || ...
+               (abs(abs_ds_here - best_abs_ds) <= 1e-12 && t_bind > best_info.t_bind)
+                best_abs_ds = abs_ds_here;
+                best_signed_ds = ds_here;
+                best_info.t_bind = t_bind;
+                best_info.s_bind = s_tar;
+                best_info.v_bind = vL;
+                best_info.a_ref_bind = aL_bind;
             end
         end
+    end
+
+    if isfinite(best_abs_ds)
+        ok = true;
+        ds = best_signed_ds;
+        info = best_info;
+    end
+end
 
 
         function roots_t = solveEqualSpeedTimesInInterval(obj, follower, t_now, t_brake, ta, tb, vLa, aL)
@@ -1026,13 +1159,10 @@ classdef IntersectionScheduler < handle
             v0 = follower.v;
             A  = Agent.A_MAX;
 
-            % 子区间1：匀速段 [ta, min(tb, t_brake)]
             if ta < t_brake
                 t1a = ta;
                 t1b = min(tb, t_brake);
 
-                % vF = v0
-                % vL = vLa + aL * (t - ta)
                 if abs(aL) > 1e-12
                     t_root = ta + (v0 - vLa) / aL;
                     if t_root >= t1a - 1e-12 && t_root <= t1b + 1e-12
@@ -1040,18 +1170,15 @@ classdef IntersectionScheduler < handle
                     end
                 else
                     if abs(v0 - vLa) <= 1e-12
-                        roots_t(end + 1) = t1a; %#ok<AGROW>
+                        roots_t(end + 1) = t1b; %#ok<AGROW>
                     end
                 end
             end
 
-            % 子区间2：减速段 [max(ta, t_brake), tb]
             if tb > t_brake
                 t2a = max(ta, t_brake);
                 t2b = tb;
 
-                % vF = v0 - A * (t - t_brake)
-                % vL = vLa + aL * (t - ta)
                 denom = A + aL;
                 numer = v0 + A * t_brake - vLa + aL * ta;
 
@@ -1063,7 +1190,7 @@ classdef IntersectionScheduler < handle
                 else
                     val_a = (v0 - A * (t2a - t_brake)) - (vLa + aL * (t2a - ta));
                     if abs(val_a) <= 1e-12
-                        roots_t(end + 1) = t2a; %#ok<AGROW>
+                        roots_t(end + 1) = t2b; %#ok<AGROW>
                     end
                 end
             end
